@@ -1,5 +1,5 @@
 python-telegram-bot
-google-genai
+groq
 fastapi
 uvicorn
 python-dotenv

@@ -1,42 +1,89 @@
-import os
+import asyncio
 import logging
+import os
+
 from dotenv import load_dotenv
+from groq import Groq
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
-# 1. Load environment variables from the .env file
+
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MY_CHAT_ID = os.getenv("MY_CHAT_ID")
+MODEL = "llama-3.3-70b-versatile"
+SYSTEM_PROMPT = "You are Luna, a warm, helpful companion."
 
-# 2. Configure basic console logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
-# 3. Define the handler function for incoming text messages
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Retrieve the chat_id and message text from the update object
+
+def get_reply(user_text: str) -> str:
+    """Get a completion from Groq without exposing client setup to handlers."""
+    client = Groq(api_key=GROQ_API_KEY)
+    completion = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ],
+    )
+    return completion.choices[0].message.content or "I couldn't generate a response."
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply to allowlisted, non-command text messages."""
+    if not update.effective_chat or not update.message or not update.message.text:
+        return
+
     chat_id = update.effective_chat.id
+    if str(chat_id) != str(MY_CHAT_ID):
+        logger.warning("Blocked message from unauthorized chat ID: %s", chat_id)
+        return
+
     user_text = update.message.text
+    logger.info("Incoming message from %s: %r", chat_id, user_text)
 
-    # Print the sender's chat_id to the console
-    print(f"\n[INCOMING MESSAGE] Chat ID: {chat_id} | Message: '{user_text}'\n")
+    try:
+        reply_text = await asyncio.to_thread(get_reply, user_text)
+    except Exception:
+        logger.exception("Groq request failed")
+        await update.message.reply_text(
+            "Sorry, I couldn't reach my AI service right now. Please try again shortly."
+        )
+        return
 
-    # Echo the text back to the Telegram chat
-    await update.message.reply_text(user_text)
+    logger.info("Luna reply: %r", reply_text)
+    await update.message.reply_text(reply_text)
 
-if __name__ == '__main__':
-    # Guard clause to ensure the token exists before running
-    if not TOKEN:
-        raise ValueError("Error: TELEGRAM_BOT_TOKEN is missing from your .env file!")
 
-    # Build the Telegram Bot application instance
+def validate_configuration() -> None:
+    missing = [
+        name
+        for name, value in {
+            "TELEGRAM_BOT_TOKEN": TOKEN,
+            "GROQ_API_KEY": GROQ_API_KEY,
+            "MY_CHAT_ID": MY_CHAT_ID,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise ValueError(f"Missing required environment variable(s): {', '.join(missing)}")
+
+
+def main() -> None:
+    validate_configuration()
     app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Register the echo handler to listen for non-command text messages
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), echo))
-
-    print("Luna Echo Bot is running... Press Ctrl+C to stop.")
+    logger.info("Luna (powered by Groq) is running. Press Ctrl+C to stop.")
     app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
