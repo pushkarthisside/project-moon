@@ -7,6 +7,8 @@ from groq import Groq
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
+from db import init_db, log_message
+
 
 load_dotenv()
 
@@ -22,11 +24,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Single client instance initialized once at module load
+groq_client = Groq(api_key=GROQ_API_KEY)
+
 
 def get_reply(user_text: str) -> str:
-    """Get a completion from Groq without exposing client setup to handlers."""
-    client = Groq(api_key=GROQ_API_KEY)
-    completion = client.chat.completions.create(
+    """Get a completion from Groq using the persistent client instance."""
+    completion = groq_client.chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -47,6 +51,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_text = update.message.text
+    log_message("user", user_text)
     logger.info("Incoming message from %s: %r", chat_id, user_text)
 
     try:
@@ -59,6 +64,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     logger.info("Luna reply: %r", reply_text)
+    log_message("luna", reply_text)
     await update.message.reply_text(reply_text)
 
 
@@ -73,11 +79,15 @@ def validate_configuration() -> None:
         if not value
     ]
     if missing:
-        raise ValueError(f"Missing required environment variable(s): {', '.join(missing)}")
+        raise ValueError(
+            f"Missing required environment variable(s): {', '.join(missing)}"
+        )
 
 
 def main() -> None:
     validate_configuration()
+    init_db()  # Runs safely on application startup only
+
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
