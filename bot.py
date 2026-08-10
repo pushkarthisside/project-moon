@@ -7,8 +7,8 @@ from groq import Groq
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
+from context import get_formatted_system_prompt
 from db import init_db, log_message
-
 
 load_dotenv()
 
@@ -16,7 +16,6 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MY_CHAT_ID = os.getenv("MY_CHAT_ID")
 MODEL = "llama-3.3-70b-versatile"
-SYSTEM_PROMPT = "You are Luna, a warm, helpful companion."
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -28,12 +27,12 @@ logger = logging.getLogger(__name__)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 
-def get_reply(user_text: str) -> str:
-    """Get a completion from Groq using the persistent client instance."""
+def get_reply(system_prompt: str, user_text: str) -> str:
+    """Get a completion from Groq using dynamic system prompt context."""
     completion = groq_client.chat.completions.create(
         model=MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
     )
@@ -51,11 +50,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_text = update.message.text
-    log_message("user", user_text)
     logger.info("Incoming message from %s: %r", chat_id, user_text)
 
+    # Build context BEFORE logging user message so RECENT CONVERSATION
+    # in database context does not duplicate the current turn.
+    system_prompt = get_formatted_system_prompt()
+
+    # Log incoming user message
+    log_message("user", user_text)
+
     try:
-        reply_text = await asyncio.to_thread(get_reply, user_text)
+        reply_text = await asyncio.to_thread(get_reply, system_prompt, user_text)
     except Exception:
         logger.exception("Groq request failed")
         await update.message.reply_text(
