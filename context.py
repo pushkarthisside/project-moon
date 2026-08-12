@@ -57,7 +57,7 @@ def build_context() -> dict:
     current_dt = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        messages = get_recent_messages(limit=20)
+        messages = get_recent_messages(limit=20) 
         recent_messages = format_messages(messages)
     except Exception as e:
         print(f"[context] Failed to retrieve recent messages: {e}")

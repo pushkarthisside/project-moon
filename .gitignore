@@ -35,4 +35,5 @@ Thumbs.db
 .coverage.*
 htmlcov/
 
-AGENTS.md
+GOALS.md
+

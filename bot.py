@@ -3,40 +3,23 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from groq import Groq
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 from context import get_formatted_system_prompt
 from db import init_db, log_message
+from llm import get_reply
 
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MY_CHAT_ID = os.getenv("MY_CHAT_ID")
-MODEL = "llama-3.3-70b-versatile"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-# Single client instance initialized once at module load
-groq_client = Groq(api_key=GROQ_API_KEY)
-
-
-def get_reply(system_prompt: str, user_text: str) -> str:
-    """Get a completion from Groq using dynamic system prompt context."""
-    completion = groq_client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ],
-    )
-    return completion.choices[0].message.content or "I couldn't generate a response."
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -52,8 +35,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_text = update.message.text
     logger.info("Incoming message from %s: %r", chat_id, user_text)
 
-    # Build context BEFORE logging user message so RECENT CONVERSATION
-    # in database context does not duplicate the current turn.
+    # Build context BEFORE logging user message to avoid duplicate current turn in transcript
     system_prompt = get_formatted_system_prompt()
 
     # Log incoming user message
@@ -62,7 +44,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         reply_text = await asyncio.to_thread(get_reply, system_prompt, user_text)
     except Exception:
-        logger.exception("Groq request failed")
+        logger.exception("LLM generation request failed")
         await update.message.reply_text(
             "Sorry, I couldn't reach my AI service right now. Please try again shortly."
         )
@@ -78,7 +60,6 @@ def validate_configuration() -> None:
         name
         for name, value in {
             "TELEGRAM_BOT_TOKEN": TOKEN,
-            "GROQ_API_KEY": GROQ_API_KEY,
             "MY_CHAT_ID": MY_CHAT_ID,
         }.items()
         if not value
@@ -96,7 +77,7 @@ def main() -> None:
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Luna (powered by Groq) is running. Press Ctrl+C to stop.")
+    logger.info("Luna is running. Press Ctrl+C to stop.")
     app.run_polling()
 
 
