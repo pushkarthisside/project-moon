@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -15,6 +16,24 @@ MODEL = "llama-3.3-70b-versatile"
 
 # Initialize Groq client
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+
+def _looks_like_pseudo_tool_output(content: str | None) -> bool:
+    """Return whether the model emitted fake/XML-like tool syntax.
+
+    This is deliberately only a safety check.  The content is never parsed or
+    executed; structured ``tool_calls`` are the only supported execution path.
+    """
+    if not isinstance(content, str) or not content:
+        return False
+    return bool(
+        re.search(
+            r"<function\s*[:=,]\s*[A-Za-z_][\w-]*(?:\s*[>,=])",
+            content,
+            re.IGNORECASE,
+        )
+        or re.search(r"</function\s*>", content, re.IGNORECASE)
+    )
 
 def get_completion(
     messages: list,
@@ -62,8 +81,9 @@ def execute_tool_call(tool_call) -> str:
     """
     name = tool_call.function.name
     try:
-        args = json.loads(tool_call.function.arguments or "{}")
-    except json.JSONDecodeError:
+        parsed_args = json.loads(tool_call.function.arguments or "{}")
+        args = parsed_args if isinstance(parsed_args, dict) else {}
+    except (json.JSONDecodeError, TypeError):
         return f"Error: could not parse arguments for tool '{name}'"
 
     fn = TOOL_MAP.get(name)
@@ -84,7 +104,7 @@ def get_reply(
     system_prompt: str,
     user_text: str,
     tools: list | None = None,
-    max_tool_rounds: int = 5,
+    max_tool_rounds: int = 3,
 ) -> str:
     """
     High-level entry point: handles a full interaction, including any number
@@ -106,13 +126,35 @@ def get_reply(
         {"role": "user", "content": user_text},
     ]
 
-    for _ in range(max_tool_rounds):
+    # A single model turn must not be able to execute the same operation over
+    # and over.  This is especially important for insert-like tools.
+    seen_tool_calls = set()
+    for _ in range(max(0, max_tool_rounds)+1):
         response = get_completion(messages, tools=tools)
         response_message = response["message"]
 
         tool_calls = response["tool_calls"]
         if not tool_calls:
-            return response["content"]
+            if _looks_like_pseudo_tool_output(response["content"]):
+                # Do not relay or interpret pseudo-function text.  Give the
+                # provider one of the remaining structured-tool rounds to
+                # correct itself.
+                messages.append({
+                    "role": "assistant",
+                    "content": response["content"],
+                })
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "The previous response used invalid pseudo-function "
+                        "text. Do not write function markup or imitate tool "
+                        "syntax. Use one of the provided structured tools "
+                        "with a tool call, or answer normally if no tool is "
+                        "needed."
+                    ),
+                })
+                continue
+            return response["content"] or "I couldn't complete that action."
 
         # Preserve the assistant's tool-call turn in the conversation, as an
         # explicit dict rather than relying on SDK object serialization.
@@ -134,7 +176,30 @@ def get_reply(
 
         # Run each requested tool and feed its result back in.
         for tool_call in tool_calls:
-            result_content = execute_tool_call(tool_call)
+            tool_name = tool_call.function.name
+            raw_arguments = tool_call.function.arguments or "{}"
+            try:
+                parsed_arguments = json.loads(raw_arguments)
+                normalized_arguments = (
+                    parsed_arguments if isinstance(parsed_arguments, dict) else {}
+                )
+                call_key = (tool_name, json.dumps(
+                    normalized_arguments, sort_keys=True, separators=(",", ":")
+                ))
+            except (json.JSONDecodeError, TypeError):
+                # Keep malformed argument handling in execute_tool_call(); the
+                # raw value still forms a stable key for duplicate detection.
+                call_key = (tool_name, str(raw_arguments))
+
+            if call_key in seen_tool_calls:
+                result_content = (
+                    f"Error: duplicate tool call for '{tool_name}' with the "
+                    "same arguments was blocked in this interaction."
+                )
+            else:
+                seen_tool_calls.add(call_key)
+                result_content = execute_tool_call(tool_call)
+
             messages.append(
                 format_tool_message(tool_call.id, result_content)
             )
@@ -143,4 +208,4 @@ def get_reply(
         # results) back to Groq for the next turn.
 
     # Safety net: if we somehow never got a plain-content response.
-    return response["content"] or "I couldn't complete that action."
+    return "I couldn't complete that action safely. Please try again."
