@@ -277,60 +277,64 @@ def get_facts(limit: int = 10) -> list[sqlite3.Row]:
 # UPDATE FUNCTIONS
 # ==========================================
 
-def update_goal_status(goal_id: int, status: str):
-    """Update goal status to 'active', 'done', or 'dropped'."""
+def update_goal_status(goal_id: int, status: str) -> bool:
+    """Update goal status. Returns True if updated, False if ID not found."""
     if status not in ("active", "done", "dropped"):
         raise ValueError("status must be 'active', 'done', or 'dropped'")
 
     conn = get_connection()
     try:
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE goals SET status = ? WHERE id = ?",
             (status, goal_id),
         )
         conn.commit()
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
 
-def update_goal_last_checked_in(goal_id: int):
+def update_goal_last_checked_in(goal_id: int) -> bool:
     """Mark the current time as the last time Luna asked about this goal."""
     conn = get_connection()
     try:
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE goals SET last_checked_in = CURRENT_TIMESTAMP WHERE id = ?",
             (goal_id,),
         )
         conn.commit()
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
 
-def update_reminder_status(reminder_id: int, status: str):
-    """Update reminder status to 'pending', 'sent', or 'dismissed'."""
+def update_reminder_status(reminder_id: int, status: str) -> bool:
+    """Update reminder status. Returns True if updated, False if ID not found."""
     if status not in ("pending", "sent", "dismissed"):
         raise ValueError("status must be 'pending', 'sent', or 'dismissed'")
 
     conn = get_connection()
     try:
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE reminders SET status = ? WHERE id = ?",
             (status, reminder_id),
         )
         conn.commit()
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
 
-def update_fact_last_referenced(fact_id: int):
+def update_fact_last_referenced(fact_id: int) -> bool:
     """Update the last_referenced timestamp when a fact is retrieved into context."""
     conn = get_connection()
     try:
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE facts SET last_referenced = CURRENT_TIMESTAMP WHERE id = ?",
             (fact_id,),
         )
         conn.commit()
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
