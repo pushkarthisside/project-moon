@@ -338,6 +338,18 @@ def update_fact_last_referenced(fact_id: int) -> bool:
     finally:
         conn.close()
 
+def fact_exists(content: str) -> bool:
+    """Check if a normalized version of fact content already exists in the facts table."""
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "SELECT 1 FROM facts WHERE LOWER(TRIM(content)) = LOWER(TRIM(?)) LIMIT 1",
+            (content.strip(),),
+        )
+        return cursor.fetchone() is not None
+    finally:
+        conn.close()
+
 
 if __name__ == "__main__":
     init_db()
