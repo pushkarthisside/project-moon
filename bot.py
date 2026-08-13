@@ -8,7 +8,8 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 
 from context import get_formatted_system_prompt
 from db import init_db, log_message
-from llm import get_reply
+from llm import get_reply, groq_client
+from memory import process_turn_memory
 
 load_dotenv()
 
@@ -53,6 +54,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info("Luna reply: %r", reply_text)
     log_message("luna", reply_text)
     await update.message.reply_text(reply_text)
+
+    # Memory formation is secondary to the conversation.  Send Luna's reply
+    # first, then run the synchronous memory extractor off the event loop.
+    if user_text.strip():
+        try:
+            saved_count = await asyncio.to_thread(
+                process_turn_memory,
+                user_text,
+                groq_client,
+            )
+            logger.info("Memory formation completed: %d fact(s) saved.", saved_count)
+        except Exception:
+            logger.exception("Memory formation failed after successful response")
 
 
 def validate_configuration() -> None:
