@@ -44,7 +44,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         reply_text = await asyncio.to_thread(get_reply, system_prompt, user_text)
     except Exception:
-        logger.exception("LLM generation request failed")
+        logger.exception("LLM generation or tool loop failed")
         await update.message.reply_text(
             "Sorry, I couldn't reach my AI service right now. Please try again shortly."
         )
@@ -77,7 +77,7 @@ def main() -> None:
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Luna is running. Press Ctrl+C to stop.")
+    logger.info("Luna (Tool Loop Enabled) is running. Press Ctrl+C to stop.")
     app.run_polling()
 
 
