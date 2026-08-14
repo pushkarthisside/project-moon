@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -10,6 +11,7 @@ from context import get_formatted_system_prompt
 from db import init_db, log_message
 from llm import get_reply, groq_client
 from memory import process_turn_memory
+from scheduler import check_due_reminders
 
 load_dotenv()
 
@@ -21,6 +23,34 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def _needs_active_goal_context(user_text: str) -> bool:
+    """Return whether the current message explicitly needs active goals."""
+    normalized = " ".join(user_text.casefold().split())
+
+    view_phrases = (
+        "active goals",
+        "my goals",
+        "which goals",
+        "what goals",
+        "goal should",
+        "review my objectives",
+    )
+    if any(phrase in normalized for phrase in view_phrases):
+        return True
+
+    has_goal_reference = re.search(r"\bgoal(?:s)?\b", normalized) is not None
+    if not has_goal_reference:
+        return False
+
+    creation_request = re.search(r"\b(create|add|set)\s+(?:a\s+)?goal\b", normalized)
+    if creation_request:
+        return False
+
+    completion_words = ("mark", "complete", "completed", "finish", "finished", "done")
+    removal_words = ("remove", "delete", "drop", "cancel", "abandon")
+    return any(word in normalized for word in completion_words + removal_words)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -37,13 +67,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info("Incoming message from %s: %r", chat_id, user_text)
 
     # Build context BEFORE logging user message to avoid duplicate current turn in transcript
-    system_prompt = get_formatted_system_prompt()
-
-    # Log incoming user message
-    log_message("user", user_text)
+    system_prompt = get_formatted_system_prompt(
+        include_goals=_needs_active_goal_context(user_text)
+    )
 
     try:
-        reply_text = await asyncio.to_thread(get_reply, system_prompt, user_text)
+        reply_result = await asyncio.to_thread(get_reply, system_prompt, user_text)
+        reply_text = reply_result["text"]
+        state_change_attempted = reply_result["state_change_attempted"]
     except Exception:
         logger.exception("LLM generation or tool loop failed")
         await update.message.reply_text(
@@ -51,13 +82,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    # Persist both sides of the successful turn only after context assembly
+    # and LLM processing are complete. This keeps the current user message
+    # out of the historical context used for this request.
+    log_message("user", user_text)
     logger.info("Luna reply: %r", reply_text)
     log_message("luna", reply_text)
     await update.message.reply_text(reply_text)
 
     # Memory formation is secondary to the conversation.  Send Luna's reply
     # first, then run the synchronous memory extractor off the event loop.
-    if user_text.strip():
+    if user_text.strip() and not state_change_attempted:
         try:
             saved_count = await asyncio.to_thread(
                 process_turn_memory,
@@ -90,6 +125,24 @@ def main() -> None:
 
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Initialize the scheduler loop
+    # Runs the check every 60 seconds, starting 10 seconds after bot boot
+    if app.job_queue is None:
+        logger.error("JobQueue is not available. Reminders will not be dispatched.")
+    else:
+        try:
+            app.job_queue.run_repeating(
+                check_due_reminders,
+                interval=60,
+                first=10,
+            )
+            logger.info("Reminder scheduler initialized.")
+        except Exception:
+            logger.exception(
+                "Failed to register reminder scheduler. "
+                "Reminders will not be dispatched."
+            )
 
     logger.info("Luna (Tool Loop Enabled) is running. Press Ctrl+C to stop.")
     app.run_polling()

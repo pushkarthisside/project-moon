@@ -52,7 +52,7 @@ def format_reminders(reminders: list) -> str:
     return "\n".join(lines)
 
 
-def build_context() -> dict:
+def build_context(include_goals: bool = True) -> dict:
     """Fetch and format application state for Luna's system prompt."""
     current_dt = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -70,12 +70,15 @@ def build_context() -> dict:
         print(f"[context] Failed to retrieve facts: {e}")
         facts_context = "[Context unavailable: known facts could not be retrieved.]"
 
-    try:
-        goals = get_active_goals()
-        goals_context = format_goals(goals)
-    except Exception as e:
-        print(f"[context] Failed to retrieve active goals: {e}")
-        goals_context = "[Context unavailable: active goals could not be retrieved.]"
+    if include_goals:
+        try:
+            goals = get_active_goals()
+            goals_context = format_goals(goals)
+        except Exception as e:
+            print(f"[context] Failed to retrieve active goals: {e}")
+            goals_context = "[Context unavailable: active goals could not be retrieved.]"
+    else:
+        goals_context = "Active goals not included for this turn."
 
     try:
         reminders = get_pending_reminders()
@@ -93,9 +96,9 @@ def build_context() -> dict:
     }
 
 
-def get_formatted_system_prompt() -> str:
+def get_formatted_system_prompt(include_goals: bool = True) -> str:
     """Retrieve formatted database context and inject it directly into LUNA_SYSTEM_PROMPT."""
-    ctx = build_context()
+    ctx = build_context(include_goals=include_goals)
     return LUNA_SYSTEM_PROMPT.format(
         current_datetime=ctx["current_datetime"],
         recent_messages=ctx["recent_messages"],

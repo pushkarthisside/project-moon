@@ -1,8 +1,11 @@
+import json
 import logging
+from datetime import datetime
 from typing import Any, Dict, Optional
 import db
 
 logger = logging.getLogger(__name__)
+DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # ==========================================
 # GOAL TOOLS
@@ -20,6 +23,13 @@ def create_goal(content: str, goal_type: str, target_date: Optional[str] = None)
     try:
         goal_id = db.create_goal(content=content, goal_type=goal_type, target_date=target_date)
         return {"success": True, "goal_id": goal_id, "message": f"Goal created successfully with ID {goal_id}."}
+    except db.DuplicateActiveGoalError as e:
+        return {
+            "success": False,
+            "goal_id": e.goal_id,
+            "error": str(e),
+            "message": "Goal was not created because an identical active goal already exists.",
+        }
     except Exception as e:
         logger.exception("Error creating goal")
         return {"success": False, "error": str(e)}
@@ -121,7 +131,12 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "create_goal",
-            "description": "Create a new active goal for the user.",
+            "description": (
+                "Create a NEW active goal for the user. Use this only when the "
+                "user wants to create, add, or set a new goal. Do NOT use this "
+                "tool to modify, complete, drop, delete, or remove an existing "
+                "goal."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -132,8 +147,11 @@ TOOL_DEFINITIONS = [
                         "description": "Time horizon of the goal. Deduce contextually (e.g., 'today' = daily, 'this month' = mid-term).",
                     },
                     "target_date": {
-                        "type": "string",
-                        "description": "Optional completion target in 'YYYY-MM-DD HH:MM:SS' format. Use null/omit when no deadline was explicitly given. Do not invent a deadline.",
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "null"},
+                        ],
+                        "description": "Optional completion target. If the user explicitly provides a deadline, provide it as a string in 'YYYY-MM-DD HH:MM:SS' format. If the user does not provide a deadline, send null or omit this property. Never invent a deadline.",
                     },
                 },
                 "required": ["content", "goal_type"],
@@ -145,14 +163,25 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "get_active_goals",
             "description": "Get all active goals currently stored in the database.",
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
         },
     },
     {
         "type": "function",
         "function": {
             "name": "update_goal_status",
-            "description": "Update the status of a specific goal (e.g., mark as done or dropped).",
+            "description": (
+                "Change the status of an EXISTING goal. Use status 'done' when "
+                "the user completed the goal. Use status 'dropped' when the user "
+                "says remove, delete, cancel, abandon, or get rid of the goal. "
+                "A dropped goal is logically removed/cancelled and no longer "
+                "appears in active goals, but is NOT physically deleted from the "
+                "database. The goal_id must match the existing goal."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -215,16 +244,161 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def execute_tool_call(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Safely resolve and execute a requested tool function."""
+def _tool_schema(tool_name: str) -> Dict[str, Any] | None:
+    """Return the model-facing schema for a registered tool."""
+    for definition in TOOL_DEFINITIONS:
+        function = definition.get("function", {})
+        if function.get("name") == tool_name:
+            return function
+    return None
+
+
+def _validate_arguments(tool_name: str, arguments: Dict[str, Any]) -> str | None:
+    """Perform lightweight validation against the tool definition."""
+    schema = _tool_schema(tool_name)
+    if schema is None:
+        return f"Error: unknown tool '{tool_name}'"
+
+    parameters = schema.get("parameters", {})
+    properties = parameters.get("properties", {})
+    required = parameters.get("required", [])
+
+    missing = [name for name in required if name not in arguments]
+    if missing:
+        return (
+            f"Error: missing required argument(s) for tool '{tool_name}': "
+            f"{', '.join(missing)}"
+        )
+
+    unexpected = [name for name in arguments if name not in properties]
+    if unexpected:
+        return (
+            f"Error: unexpected argument(s) for tool '{tool_name}': "
+            f"{', '.join(unexpected)}"
+        )
+
+    for name, value in arguments.items():
+        definition = properties[name]
+        expected_type = definition.get("type")
+
+        if value is None and name not in required:
+            continue
+
+        if expected_type == "string" and not isinstance(value, str):
+            return f"Error: argument '{name}' for tool '{tool_name}' must be a string"
+        if expected_type == "integer" and (
+            isinstance(value, bool) or not isinstance(value, int)
+        ):
+            return f"Error: argument '{name}' for tool '{tool_name}' must be an integer"
+
+        if name in ("target_date", "remind_at"):
+            if not isinstance(value, str):
+                return (
+                    f"Error: argument '{name}' for tool '{tool_name}' must be a "
+                    "datetime string or null"
+                )
+
+            try:
+                parsed_datetime = datetime.strptime(value, DATETIME_FORMAT)
+            except ValueError:
+                return (
+                    f"Error: argument '{name}' for tool '{tool_name}' must be a "
+                    f"valid datetime in {DATETIME_FORMAT!r} format"
+                )
+
+            if parsed_datetime.strftime(DATETIME_FORMAT) != value:
+                return (
+                    f"Error: argument '{name}' for tool '{tool_name}' must use "
+                    f"the exact {DATETIME_FORMAT!r} format"
+                )
+
+            if name == "remind_at" and parsed_datetime <= datetime.now():
+                return f"Error: argument 'remind_at' for tool '{tool_name}' must be in the future"
+
+        allowed_values = definition.get("enum")
+        if allowed_values is not None and value not in allowed_values:
+            return (
+                f"Error: argument '{name}' for tool '{tool_name}' must be one of: "
+                f"{', '.join(map(str, allowed_values))}"
+            )
+
+    return None
+
+
+def execute_tool_call(tool_name: str, raw_arguments: Any) -> str:
+    """Parse, validate, execute, and serialize one requested tool call."""
     func = TOOL_MAP.get(tool_name)
     if not func:
-        return {"success": False, "error": f"Tool '{tool_name}' is not recognized."}
-    
+        logger.warning(
+            "Tool validation failed: name=%s reason=unknown tool",
+            tool_name,
+        )
+        return f"Error: unknown tool '{tool_name}'"
+
     try:
-        return func(**arguments)
-    except TypeError as e:
-        return {"success": False, "error": f"Invalid arguments for tool '{tool_name}': {e}"}
+        if raw_arguments is None or raw_arguments == "":
+            arguments = {}
+        elif isinstance(raw_arguments, str):
+            parsed_arguments = json.loads(raw_arguments)
+            # Preserve the existing zero-argument-tool behavior for JSON null.
+            arguments = {} if parsed_arguments is None else parsed_arguments
+        else:
+            arguments = raw_arguments
+    except (json.JSONDecodeError, TypeError) as exc:
+        reason = f"could not parse arguments: {exc}"
+        logger.warning(
+            "Tool validation failed: name=%s reason=%s",
+            tool_name,
+            reason,
+        )
+        return f"Error: could not parse arguments for tool '{tool_name}'"
+
+    logger.debug(
+        "execute_tool_call received request: name=%s parsed_arguments=%r",
+        tool_name,
+        arguments,
+    )
+
+    if not isinstance(arguments, dict):
+        logger.warning(
+            "Tool validation failed: name=%s reason=arguments must be a JSON object",
+            tool_name,
+        )
+        return f"Error: arguments for tool '{tool_name}' must be a JSON object"
+
+    validation_error = _validate_arguments(tool_name, arguments)
+    if validation_error:
+        logger.warning(
+            "Tool validation failed: name=%s reason=%s",
+            tool_name,
+            validation_error,
+        )
+        return validation_error
+
+    try:
+        result = func(**arguments)
+    except Exception as exc:
+        logger.exception(
+            "Tool function raised: name=%s exception=%s",
+            tool_name,
+            exc,
+        )
+        return f"Error running tool '{tool_name}': {exc}"
+
+    logger.debug(
+        "Tool succeeded: name=%s result_type=%s",
+        tool_name,
+        type(result).__name__,
+    )
+
+    if isinstance(result, str):
+        return result
+
+    try:
+        return json.dumps(result)
+    except (TypeError, ValueError) as exc:
+        logger.exception("Could not serialize result from tool '%s'", tool_name)
+        return f"Error: could not serialize result from tool '{tool_name}': {exc}"
 
 
 if __name__ == "__main__":

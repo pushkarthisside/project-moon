@@ -128,6 +128,19 @@ def create_fact(category: str, content: str, importance: int = 3):
         conn.close()
 
 
+def normalize_goal_content(content: str) -> str:
+    """Normalize goal text for exact, case-insensitive duplicate checks."""
+    return " ".join(content.strip().lower().split())
+
+
+class DuplicateActiveGoalError(ValueError):
+    """Raised when an active goal has the same normalized content."""
+
+    def __init__(self, goal_id: int):
+        self.goal_id = goal_id
+        super().__init__(f"An active goal with the same content already exists (ID {goal_id}).")
+
+
 def create_goal(content: str, goal_type: str, target_date: str | None = None):
     """Create a new goal and return its ID. target_date expects 'YYYY-MM-DD HH:MM:SS'."""
     valid_types = ("daily", "mid-term", "long-term")
@@ -136,6 +149,14 @@ def create_goal(content: str, goal_type: str, target_date: str | None = None):
 
     conn = get_connection()
     try:
+        normalized_content = normalize_goal_content(content)
+        active_goals = conn.execute(
+            "SELECT id, content FROM goals WHERE status = 'active'"
+        ).fetchall()
+        for goal in active_goals:
+            if normalize_goal_content(goal["content"]) == normalized_content:
+                raise DuplicateActiveGoalError(goal["id"])
+
         cursor = conn.execute(
             """
             INSERT INTO goals (content, type, target_date)

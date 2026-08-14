@@ -1,10 +1,11 @@
 import json
+import logging
 import os
 import re
 from dotenv import load_dotenv
 from groq import Groq
 
-from tools import TOOL_DEFINITIONS, TOOL_MAP
+from tools import TOOL_DEFINITIONS, execute_tool_call
 
 load_dotenv()
 
@@ -12,7 +13,15 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("Missing required environment variable: GROQ_API_KEY")
 
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "llama-3.1-8b-instant"
+
+logger = logging.getLogger(__name__)
+STATE_CHANGE_TOOLS = frozenset({
+    "create_goal",
+    "update_goal_status",
+    "create_reminder",
+    "update_reminder_status",
+})
 
 # Initialize Groq client
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -49,6 +58,7 @@ def get_completion(
     kwargs = {
         "model": MODEL,
         "messages": messages,
+        "temperature": 0.0,
     }
 
     if tools:
@@ -56,12 +66,28 @@ def get_completion(
         kwargs["tool_choice"] = "auto"
 
     completion = groq_client.chat.completions.create(**kwargs)
-    response_message = completion.choices[0].message
+    choices = getattr(completion, "choices", None)
+    if not choices:
+        raise RuntimeError("Groq returned no completion choices")
+
+    try:
+        first_choice = choices[0]
+    except (IndexError, KeyError, TypeError):
+        raise RuntimeError("Groq returned malformed completion choices") from None
+
+    response_message = getattr(first_choice, "message", None)
+    if response_message is None:
+        raise RuntimeError("Groq completion did not contain a response message")
+
+    if not hasattr(response_message, "content") and not hasattr(
+        response_message, "tool_calls"
+    ):
+        raise RuntimeError("Groq response message has an unexpected shape")
 
     return {
         "message": response_message,  # raw message object, needed to append back into `messages`
-        "content": response_message.content,
-        "tool_calls": response_message.tool_calls,
+        "content": getattr(response_message, "content", None),
+        "tool_calls": getattr(response_message, "tool_calls", None),
     }
 
 
@@ -74,38 +100,12 @@ def format_tool_message(call_id: str, tool_result_content: str) -> dict:
     }
 
 
-def execute_tool_call(tool_call) -> str:
-    """
-    Runs a single tool call against TOOL_MAP and returns the result
-    as a string, ready to be wrapped by format_tool_message().
-    """
-    name = tool_call.function.name
-    try:
-        parsed_args = json.loads(tool_call.function.arguments or "{}")
-        args = parsed_args if isinstance(parsed_args, dict) else {}
-    except (json.JSONDecodeError, TypeError):
-        return f"Error: could not parse arguments for tool '{name}'"
-
-    fn = TOOL_MAP.get(name)
-    if fn is None:
-        return f"Error: unknown tool '{name}'"
-
-    try:
-        result = fn(**args)
-    except Exception as exc:  # keep the loop alive; report the failure to the model
-        return f"Error running tool '{name}': {exc}"
-
-    if not isinstance(result, str):
-        result = json.dumps(result)
-    return result
-
-
 def get_reply(
     system_prompt: str,
     user_text: str,
     tools: list | None = None,
     max_tool_rounds: int = 3,
-) -> str:
+) -> dict:
     """
     High-level entry point: handles a full interaction, including any number
     of tool-call round trips.
@@ -129,13 +129,27 @@ def get_reply(
     # A single model turn must not be able to execute the same operation over
     # and over.  This is especially important for insert-like tools.
     seen_tool_calls = set()
-    for _ in range(max(0, max_tool_rounds)+1):
+    state_change_attempted = False
+    last_loop_path = "no completion round was started"
+    for _ in range(max(0, max_tool_rounds)):
+        current_round = _ + 1
+        last_loop_path = f"completion round {current_round} started"
         response = get_completion(messages, tools=tools)
         response_message = response["message"]
 
         tool_calls = response["tool_calls"]
         if not tool_calls:
             if _looks_like_pseudo_tool_output(response["content"]):
+                last_loop_path = (
+                    f"round {current_round} returned pseudo-tool output; "
+                    "requested structured-tool correction"
+                )
+                logger.warning(
+                    "Pseudo-tool output blocked in round %s/%s; continuing "
+                    "with structured-tool correction",
+                    current_round,
+                    max_tool_rounds,
+                )
                 # Do not relay or interpret pseudo-function text.  Give the
                 # provider one of the remaining structured-tool rounds to
                 # correct itself.
@@ -154,7 +168,10 @@ def get_reply(
                     ),
                 })
                 continue
-            return response["content"] or "I couldn't complete that action."
+            return {
+                "text": response["content"] or "I couldn't complete that action.",
+                "state_change_attempted": state_change_attempted,
+            }
 
         # Preserve the assistant's tool-call turn in the conversation, as an
         # explicit dict rather than relying on SDK object serialization.
@@ -178,6 +195,11 @@ def get_reply(
         for tool_call in tool_calls:
             tool_name = tool_call.function.name
             raw_arguments = tool_call.function.arguments or "{}"
+            logger.debug(
+                "Model requested tool: name=%s raw_arguments=%r",
+                tool_name,
+                raw_arguments,
+            )
             try:
                 parsed_arguments = json.loads(raw_arguments)
                 normalized_arguments = (
@@ -192,13 +214,26 @@ def get_reply(
                 call_key = (tool_name, str(raw_arguments))
 
             if call_key in seen_tool_calls:
+                logger.warning(
+                    "Duplicate tool call blocked: name=%s normalized_arguments=%s",
+                    tool_name,
+                    call_key[1],
+                )
                 result_content = (
                     f"Error: duplicate tool call for '{tool_name}' with the "
                     "same arguments was blocked in this interaction."
                 )
             else:
                 seen_tool_calls.add(call_key)
-                result_content = execute_tool_call(tool_call)
+                if tool_name in STATE_CHANGE_TOOLS:
+                    state_change_attempted = True
+                result_content = execute_tool_call(
+                    tool_name,
+                    raw_arguments,
+                )
+                last_loop_path = (
+                    f"round {current_round} executed requested tool '{tool_name}'"
+                )
 
             messages.append(
                 format_tool_message(tool_call.id, result_content)
@@ -208,4 +243,15 @@ def get_reply(
         # results) back to Groq for the next turn.
 
     # Safety net: if we somehow never got a plain-content response.
-    return "I couldn't complete that action safely. Please try again."
+    logger.error(
+        "Final safe fallback returned: reason=max_tool_rounds reached; "
+        "current_round=%s configured_max=%s; path=%s; "
+        "response=I couldn't complete that action safely. Please try again.",
+        max(0, max_tool_rounds),
+        max_tool_rounds,
+        last_loop_path,
+    )
+    return {
+        "text": "I couldn't complete that action safely. Please try again.",
+        "state_change_attempted": state_change_attempted,
+    }

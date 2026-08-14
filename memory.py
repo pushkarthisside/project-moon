@@ -9,6 +9,39 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+_TRIVIAL_MEMORY_MESSAGES = frozenset({
+    "ok",
+    "okay",
+    "k",
+    "lol",
+    "lmao",
+    "thanks",
+    "thank you",
+    "yeah",
+    "yep",
+    "nope",
+    "cool",
+    "nice",
+    "sure",
+    "hi",
+    "hello",
+    "hey",
+    "what",
+    "huh",
+    "why",
+    "how",
+})
+
+
+def _should_attempt_memory_extraction(user_text: str) -> bool:
+    """Return whether text is informative enough to ask the memory LLM about."""
+    if not isinstance(user_text, str):
+        return False
+
+    normalized = user_text.strip().lower().strip("!?.,;:")
+    return bool(normalized) and normalized not in _TRIVIAL_MEMORY_MESSAGES
+
+
 MEMORY_EXTRACTOR_PROMPT = """
 You are the Memory Gatekeeper for Project Moon.
 Analyze the provided user text and extract durable, long-term facts worth remembering about the user (e.g., goals, studies, preferences, identity, habits).
@@ -34,7 +67,31 @@ CRITICAL RULES:
    - "Currently in 3rd semester."
    - "Has started applying for internships."
 6. Ignore temporary states ("I'm tired"), transient thoughts, or questions.
-7. Output MUST be valid JSON with the following structure:
+7. DEFAULT TO NOT SAVING A MEMORY. Only save information when it is
+   reasonably likely to remain useful beyond the current conversation and
+   meaningfully improve Luna's future understanding of the user.
+8. Good candidates include long-term goals, ongoing commitments, stable
+   preferences, recurring habits or patterns, important decisions, persistent
+   plans, meaningful constraints, durable career or education information, and
+   other information likely to matter in future conversations.
+9. Do NOT save one-off meals, one-off activities, temporary moods or states,
+   casual daily events, trivial conversational details, isolated progress
+   updates unless they represent a meaningful durable state, or information
+   that is only useful for the current turn.
+   Durability and future usefulness matter more than whether the event happened
+   today. For example, a decision to switch a career focus to AI/ML may be
+   worth saving, while eating a meal today is not.
+10. Do not extract multiple facts that express the same underlying information
+    from one user message.
+11. If the user's statement is already represented by an existing fact, return
+    no new fact. Do not create paraphrased duplicates of existing facts.
+12. Preserve meaningful differences in temporal state or intention. For
+    example, "Plans to focus on backend development this year" and "Currently
+    focused on learning backend development" may represent different states
+    and should not automatically be treated as identical.
+13. Do not infer changes or contradictions unless the user explicitly states
+    them.
+14. Output MUST be valid JSON with the following structure:
 {
   "facts": [
     {"category": "education", "content": "Studying Java and DSA", "importance": 4}
@@ -80,14 +137,32 @@ def _validate_extracted_facts(data: object) -> list[dict]:
     return valid_facts
 
 
-def extract_memories(user_text: str, client: Groq, model: str = "llama-3.3-70b-versatile") -> list[dict]:
+def extract_memories(user_text: str, client: Groq, model: str = "llama-3.1-8b-instant") -> list[dict]:
     """Extract durable facts strictly from the user's input."""
+    if not _should_attempt_memory_extraction(user_text):
+        return []
+
     try:
+        existing_facts = get_facts(limit=10)
+        existing_facts_context = "\n".join(
+            f"- [{fact['category']}] {fact['content']}"
+            for fact in existing_facts
+        ) or "(none)"
+
         response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": MEMORY_EXTRACTOR_PROMPT},
-                {"role": "user", "content": user_text},
+                {
+                    "role": "user",
+                    "content": (
+                        "Existing stored facts for duplicate and relevance "
+                        "checking:\n"
+                        f"{existing_facts_context}\n\n"
+                        "Current user text:\n"
+                        f"{user_text}"
+                    ),
+                },
             ],
             response_format={"type": "json_object"},
         )
