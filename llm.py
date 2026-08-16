@@ -2,8 +2,9 @@ import json
 import logging
 import os
 import re
+import time
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, APIConnectionError, APIStatusError, RateLimitError
 
 from tools import TOOL_DEFINITIONS, execute_tool_call
 
@@ -13,7 +14,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("Missing required environment variable: GROQ_API_KEY")
 
-MODEL = "llama-3.1-8b-instant"
+
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
+MAX_GROQ_RETRIES = 1
+RETRY_BACKOFF_SECONDS = (1,)
+MAX_RETRY_AFTER_SECONDS = 5
 
 logger = logging.getLogger(__name__)
 STATE_CHANGE_TOOLS = frozenset({
@@ -25,6 +31,95 @@ STATE_CHANGE_TOOLS = frozenset({
 
 # Initialize Groq client
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+
+def _retry_after_seconds(exc: RateLimitError) -> float | None:
+    """Return a bounded Retry-After value when the SDK exposes one."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+
+    value = (
+        headers.get("retry-after")
+        or headers.get("Retry-After")
+        or headers.get("x-ratelimit-reset-requests")
+    )
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        duration = re.fullmatch(
+            r"\s*(?:(\d+(?:\.\d+)?)h)?\s*"
+            r"(?:(\d+(?:\.\d+)?)m)?\s*"
+            r"(?:(\d+(?:\.\d+)?)s)?\s*",
+            value,
+            re.IGNORECASE,
+        )
+        if duration and any(duration.groups()):
+            delay = (
+                float(duration.group(1) or 0) * 3600
+                + float(duration.group(2) or 0) * 60
+                + float(duration.group(3) or 0)
+            )
+            return min(delay, MAX_RETRY_AFTER_SECONDS)
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        return None
+    if delay < 0:
+        return None
+    return min(delay, MAX_RETRY_AFTER_SECONDS)
+
+
+def _call_groq_with_retry(**kwargs):
+    """Call the Groq completion endpoint with a small retry budget.
+
+    Retries only on rate limits and transient connection errors, since those
+    are the failure modes where waiting a moment and retrying can actually
+    succeed. Auth/bad-request/other API errors are not retried; they won't
+    be fixed by waiting, so we fail fast and let the caller's existing
+    error handling (bot.py's top-level except) surface a clean message.
+    """
+    last_exc = None
+    for attempt in range(MAX_GROQ_RETRIES + 1):
+        try:
+            return groq_client.chat.completions.create(**kwargs)
+        except (RateLimitError, APIConnectionError) as exc:
+            last_exc = exc
+            if attempt < MAX_GROQ_RETRIES:
+                if isinstance(exc, RateLimitError):
+                    wait = _retry_after_seconds(exc)
+                    if wait is None:
+                        wait = RETRY_BACKOFF_SECONDS[0]
+                else:
+                    wait = RETRY_BACKOFF_SECONDS[0]
+                logger.warning(
+                    "Groq call failed (%s), attempt %s/%s; retrying in %ss",
+                    type(exc).__name__,
+                    attempt + 1,
+                    MAX_GROQ_RETRIES + 1,
+                    wait,
+                )
+                time.sleep(wait)
+                continue
+            logger.error(
+                "Groq call failed after %s attempts (%s); giving up",
+                MAX_GROQ_RETRIES + 1,
+                type(exc).__name__,
+            )
+            raise
+        except APIStatusError as exc:
+            # Non-retryable API error (bad request, auth, model deprecated,
+            # etc.). Log with the status code so a deprecated/renamed model
+            # shows up clearly in logs instead of a generic failure.
+            logger.error(
+                "Groq API error: status=%s message=%s",
+                getattr(exc, "status_code", "unknown"),
+                str(exc),
+            )
+            raise
+    raise last_exc  # pragma: no cover - loop always returns or raises
 
 
 def _looks_like_pseudo_tool_output(content: str | None) -> bool:
@@ -65,7 +160,7 @@ def get_completion(
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
 
-    completion = groq_client.chat.completions.create(**kwargs)
+    completion = _call_groq_with_retry(**kwargs)
     choices = getattr(completion, "choices", None)
     if not choices:
         raise RuntimeError("Groq returned no completion choices")
@@ -104,7 +199,7 @@ def get_reply(
     system_prompt: str,
     user_text: str,
     tools: list | None = None,
-    max_tool_rounds: int = 3,
+    max_tool_rounds: int = 2,
 ) -> dict:
     """
     High-level entry point: handles a full interaction, including any number

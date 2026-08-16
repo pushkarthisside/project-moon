@@ -1,13 +1,21 @@
 import json
 import logging
 import os
+import re
+import time
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, APIConnectionError, RateLimitError
 from db import create_fact, fact_exists, get_facts
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+MEMORY_MODEL = os.getenv("GROQ_MEMORY_MODEL", "openai/gpt-oss-20b")
+
+MAX_GROQ_RETRIES = 1
+RETRY_BACKOFF_SECONDS = (0.5,)
 
 _TRIVIAL_MEMORY_MESSAGES = frozenset({
     "ok",
@@ -30,7 +38,14 @@ _TRIVIAL_MEMORY_MESSAGES = frozenset({
     "huh",
     "why",
     "how",
+    "good morning",
+    "good night",
 })
+
+_TRANSIENT_MEMORY_PATTERNS = (
+    r"^(?:bro\s+)?i['’]?m\s+(?:so\s+)?(?:tired|bored|sleepy|hungry)(?:\s+(?:right\s+now|today))?$",
+    r"^(?:what\s+should\s+i\s+do|that['’]?s\s+crazy)$",
+)
 
 
 def _should_attempt_memory_extraction(user_text: str) -> bool:
@@ -39,7 +54,12 @@ def _should_attempt_memory_extraction(user_text: str) -> bool:
         return False
 
     normalized = user_text.strip().lower().strip("!?.,;:")
-    return bool(normalized) and normalized not in _TRIVIAL_MEMORY_MESSAGES
+    if not normalized or normalized in _TRIVIAL_MEMORY_MESSAGES:
+        return False
+    return not any(
+        re.fullmatch(pattern, normalized)
+        for pattern in _TRANSIENT_MEMORY_PATTERNS
+    )
 
 
 MEMORY_EXTRACTOR_PROMPT = """
@@ -137,7 +157,7 @@ def _validate_extracted_facts(data: object) -> list[dict]:
     return valid_facts
 
 
-def extract_memories(user_text: str, client: Groq, model: str = "llama-3.1-8b-instant") -> list[dict]:
+def extract_memories(user_text: str, client: Groq, model: str = MEMORY_MODEL) -> list[dict]:
     """Extract durable facts strictly from the user's input."""
     if not _should_attempt_memory_extraction(user_text):
         return []
@@ -149,7 +169,7 @@ def extract_memories(user_text: str, client: Groq, model: str = "llama-3.1-8b-in
             for fact in existing_facts
         ) or "(none)"
 
-        response = client.chat.completions.create(
+        completion_kwargs = dict(
             model=model,
             messages=[
                 {"role": "system", "content": MEMORY_EXTRACTOR_PROMPT},
@@ -166,6 +186,31 @@ def extract_memories(user_text: str, client: Groq, model: str = "llama-3.1-8b-in
             ],
             response_format={"type": "json_object"},
         )
+
+        response = None
+        last_exc = None
+        for attempt in range(MAX_GROQ_RETRIES + 1):
+            try:
+                response = client.chat.completions.create(**completion_kwargs)
+                break
+            except (RateLimitError, APIConnectionError) as exc:
+                last_exc = exc
+                if attempt < MAX_GROQ_RETRIES:
+                    wait = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
+                    logger.warning(
+                        "Memory extraction Groq call failed (%s), attempt "
+                        "%s/%s; retrying in %ss",
+                        type(exc).__name__,
+                        attempt + 1,
+                        MAX_GROQ_RETRIES + 1,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+        if response is None:
+            raise last_exc
+
         content = response.choices[0].message.content or "{}"
         data = json.loads(content)
         return _validate_extracted_facts(data)
