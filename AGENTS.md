@@ -39,16 +39,18 @@ If a requested change would require reversing this constraint, flag it instead o
 - Telegram: `python-telegram-bot`
 - Telegram mode: polling
 - LLM provider: Groq
-- Current model: `llama-3.3-70b-versatile`
+- Main model: `openai/gpt-oss-120b`
+- Memory extraction model: `openai/gpt-oss-20b`
 - LLM SDK: Groq Python SDK
 - Database: SQLite
 - Database path: `data/moon.db`
 - Deployment target: Android + Termux
 - Environment variables: `.env` via `python-dotenv`
+- Model configuration: `GROQ_MODEL` and `GROQ_MEMORY_MODEL`
 - Scheduler: APScheduler foundation exists / planned for the v1 proactive/reminder execution layer.
 - Git/GitHub: source control
 
-The LLM provider should remain replaceable. Do not spread Groq-specific assumptions throughout the application.
+The LLM provider and model IDs should remain replaceable. Do not spread Groq-specific assumptions throughout the application. `gpt-oss-120b` is the main conversation, reasoning, and tool-calling model; `gpt-oss-20b` is the narrower structured memory-extraction model. Neither model is hallucination-free.
 
 ---
 
@@ -92,13 +94,14 @@ project-moon/
 ├── tools.py            # Deterministic tool definitions and tool execution handler
 ├── memory.py           # Memory extraction, validation, and persistence pipeline
 ├── requirements.txt
-├── AGENTS.md           # AI coding-agent instructions (Source of truth for dev state)
-├── GOALS.md            # Master project specification / roadmap
+├── AGENTS.md           # AI coding-agent instructions; source of truth for current dev state
 ├── .env                # NOT committed
 ├── .gitignore
 └── data/
     └── moon.db         # NOT committed; local personal state
 ```
+
+`AGENTS.md` is the single source of truth for the current architecture, implementation status, remaining work, and short-term roadmap.
 
 Planned modules as complexity grows:
 
@@ -200,7 +203,7 @@ Purpose:
 
 # 6. CURRENTLY COMPLETED
 
-The project has completed its foundation, tool calling, and memory formation pipelines.
+The project has completed the foundation and is now in stabilization rather than feature expansion.
 
 ## Platform foundation — COMPLETE
 
@@ -252,12 +255,6 @@ Completed:
 - LLM tool-call orchestration in `bot.py` / `tools.py`
 - SQLite as the deterministic source of truth
 
-Not yet complete:
-- Reminder scheduling
-- Detecting due reminders
-- Telegram reminder delivery
-- Marking reminders as sent after successful delivery
-
 ## Memory Formation — COMPLETE
 
 Implemented:
@@ -266,6 +263,8 @@ Implemented:
 - Persistence of curated facts into the `facts` table
 - Background execution via `asyncio.to_thread()` so response delivery is not delayed
 - Failure isolation so memory issues do not block normal conversation flow
+- State-change tracking for relevant updates to goals, reminders, and application state
+- Memory extraction gating to avoid unnecessary or low-value fact creation
 
 ## Memory Retrieval — BASIC BASELINE
 
@@ -287,6 +286,14 @@ Current behavior:
 
 This is intentional for v1.
 
+## Model configuration — COMPLETE BASELINE
+
+Current configuration baseline:
+- Main Luna model: `openai/gpt-oss-120b`
+- Memory extraction model: `openai/gpt-oss-20b`
+- Environment variables: `GROQ_MODEL`, `GROQ_MEMORY_MODEL`
+- Model selection remains configurable and must not be hard-coded across the project
+
 ## Memory architecture rules
 
 - Current duplicate prevention uses normalized exact content matching through `db.fact_exists()`.
@@ -302,10 +309,16 @@ This is intentional for v1.
   - The failure should be logged.
   - The user should not receive a memory-system error.
 - Memory formation currently runs after response generation using `asyncio.to_thread()` because the memory extractor uses the synchronous Groq client.
-- The project continues to treat the LLM provider as replaceable, but current v1 memory extraction directly uses the synchronous Groq client in `memory.py`.
+- The project continues to treat the LLM provider and model IDs as replaceable, but current v1 memory extraction directly uses the synchronous Groq client in `memory.py`.
 - `llm.py` owns the main Luna conversational/tool-calling Groq boundary.
 - `memory.py` currently uses the Groq client for its separate structured extraction task.
 - Additional Groq-specific logic should not be spread into unrelated modules without a concrete architectural reason.
+
+## API reliability / retry handling — IN PROGRESS
+
+- Basic retry and error handling exists for LLM/API failures.
+- Rate-limit and latency issues remain primary stabilization problems.
+- Reducible API usage should be prioritized before adding more model intelligence.
 
 ---
 
@@ -358,32 +371,81 @@ Memory formation must happen after Luna's response generation and must not delay
 
 # 8. CURRENT DEVELOPMENT PHASE
 
-## Phase A — Foundation: COMPLETE
+## Phase 1 — Stabilization: IN PROGRESS
 
 Completed:
-- Telegram, Groq, Auth allowlist, SQLite
-- Schema and CRUD operations
-- System prompt baseline and context layer
+- Telegram
+- single-user authentication
+- SQLite
+- messages/facts/goals/reminders/check_ins
+- DB CRUD
+- Luna system prompt
+- context layer
+- tool calling
+- goal tools
+- reminder tools
+- memory formation
+- memory persistence
+- basic memory retrieval
+- state-change tracking
+- model configuration
+- basic API retry/error handling
+- memory extraction gating
 
----
+Phase 1 is currently in STABILIZATION, not feature expansion.
 
-## Phase B — Core Intelligence & State: IN PROGRESS
+## Phase 1 bottlenecks — current engineering problems
 
-Completed:
-- Context integration
-- LLM tool calling
-- Goal execution
-- Reminder CRUD and tooling
-- Memory formation
-- Memory persistence
-- Baseline memory retrieval
+1. Rate limits
+   - Too many LLM calls can occur per user turn.
+   - Tool loops and memory extraction can multiply API usage.
+   - Reduce unnecessary calls before adding more intelligence.
 
-Remaining:
-1. Deterministic reminder scheduler
-2. Reminder delivery via Telegram
-3. Basic proactive check-ins
-4. End-to-end testing
-5. Moon v1 freeze
+2. Response latency
+   - Full response currently waits for the LLM/tool interaction.
+   - Reduce unnecessary model rounds.
+   - Streaming is a future optimization for perceived latency.
+
+3. Memory duplication/quality
+   - Exact normalized duplicate prevention exists.
+   - Semantic duplicates are still possible.
+   - Do not introduce embeddings/vector DB merely to solve this in v1.
+   - Improve gating and deterministic handling first.
+
+4. Robotic conversation quality
+   - Luna can still sound like a generic AI assistant.
+   - Improve conversational behavior in prompt.py.
+   - Avoid excessive validation, repetition, generic coaching, and unnecessary goal references.
+
+5. Model stability
+   - Model IDs must remain configurable.
+   - Do not hard-code model assumptions throughout the project.
+
+## Phase 1 remaining work
+
+1. Stabilize main/memory model configuration
+2. Reduce unnecessary LLM/API calls
+3. Improve rate-limit/error handling
+4. Improve memory gating and duplicate handling
+5. Improve Luna conversational quality
+6. Improve perceived response latency / streaming where appropriate
+7. Finish deterministic reminder scheduler
+8. Implement reminder delivery
+9. Implement basic proactive check-ins
+10. Perform end-to-end testing
+11. Freeze Moon v1
+12. Deploy to Termux
+13. Begin real-world usage
+
+Do not make the scheduler appear to be the immediate next task if the stabilization work above is unfinished.
+
+## Scheduler architecture rules
+
+- Scheduler is deterministic.
+- Reminders are stored in SQLite.
+- pending → sent only after successful Telegram delivery.
+- Failed Telegram delivery must not mark a reminder as sent.
+- Scheduler must not become an LLM responsibility.
 
 ---
 
@@ -423,36 +485,44 @@ Once this loop works reliably end-to-end, freeze v1 before introducing v2 featur
 
 Follow this exact sequence:
 
-## Step 1 — Bot & context integration ✅
-Pipeline established and tested.
+## Step 1 — Stabilize main/memory model configuration ✅
+Keep `GROQ_MODEL` and `GROQ_MEMORY_MODEL` authoritative and configurable.
 
-## Step 2 — Tool calling ✅
-Goal and reminder execution wired deterministically.
+## Step 2 — Reduce unnecessary LLM/API calls ✅
+Cut redundant tool and memory-trigger churn before expanding capability.
 
-## Step 3 — Basic memory ✅
-Post-response memory extraction, validation, and retrieval operational.
+## Step 3 — Improve rate-limit and error handling 🟡
+Harden against API throttling, retry behavior, and partial failures.
 
-## Step 4 — Reminder scheduler ⏳ (NEXT)
-Implement deterministic reminder execution via APScheduler:
-```text
-Reminder stored (pending)
-        ↓
-Scheduler checks due reminders
-        ↓
-Telegram sends reminder message
-        ↓
-Update status to 'sent'
-```
-*Note: If Telegram send fails, DO NOT mark as sent.*
+## Step 4 — Improve memory gating and duplicate handling 🟡
+Tighten extraction quality without introducing embeddings or vector DB in v1.
 
-## Step 5 — Basic proactive check-ins ⏳
-Simple daily trigger inspecting active state/check-ins to initiate conversation.
+## Step 5 — Improve Luna conversational quality 🟡
+Refine prompt behavior and reduce robotic, repetitive, over-validated replies.
 
-## Step 6 — End-to-end testing ⏳
+## Step 6 — Improve perceived response latency / streaming where appropriate 🟡
+Reduce unnecessary model rounds and optimize the user-facing loop.
+
+## Step 7 — Finish deterministic reminder scheduler ⏳
+Keep reminder state in SQLite and ensure pending → sent only after successful Telegram delivery.
+
+## Step 8 — Implement reminder delivery ⏳
+Send due reminders through Telegram and do not mark them as sent on failure.
+
+## Step 9 — Implement basic proactive check-ins ⏳
+Add simple state-aware prompts without turning the scheduler into an LLM responsibility.
+
+## Step 10 — Perform end-to-end testing ⏳
 Validate normal flow, tools, memory, reminders, recovery, and failure paths.
 
-## Step 7 — Freeze v1 ⏳
-Freeze code and deploy to Android/Termux for real-world usage.
+## Step 11 — Freeze Moon v1 ⏳
+Lock the working baseline before adding new features.
+
+## Step 12 — Deploy to Termux ⏳
+Run the stabilized bot in the target environment.
+
+## Step 13 — Begin real-world usage ⏳
+Collect evidence, fix failures, and iterate slowly.
 
 ---
 
@@ -529,7 +599,7 @@ Do NOT build for v1:
 # 15. SOURCE-OF-TRUTH RULE
 
 Database/application state is authoritative for deterministic facts.
-
+`AGENTS.md` is the source of truth for current architecture and implementation status.
 The LLM is NOT authoritative for:
 - Whether a goal exists or is complete
 - Whether a reminder exists or was sent
@@ -585,71 +655,77 @@ Unavailable state (Database or infrastructure query error)
                    YOU ARE HERE
                         │
                         ▼
-             ┌────────────────────┐
-             │ Reminder scheduler │  ⏳ NEXT
-             └──────────┬─────────┘
+            Phase 1 stabilization
                         │
                         ▼
-                Reminder delivery
+     Model config + API call reduction
                         │
                         ▼
-               Basic proactive check-ins
+      Rate-limit + latency handling
                         │
                         ▼
-               End-to-end testing
+     Memory quality + prompt tuning
                         │
                         ▼
-                Moon v1 freeze
+     Scheduler + reminder delivery
+                        │
+                        ▼
+    Proactive check-ins + testing
+                        │
+                        ▼
+                 Moon v1 freeze
                         │
                         ▼
                Termux deployment
                         │
                         ▼
                Real-world usage
-                        │
-                        ▼
-         Failure-driven maintenance
 ```
 
 Do not add pattern detection, reflection, advanced memory, vector DB, RAG, or multi-agent architecture before v1 is frozen.
+
+## After Moon v1 — short future roadmap
+
+- Real-world usage and failure-driven maintenance
+- Better memory retrieval/update mechanisms
+- Pattern detection
+- Reflection
+- More adaptive proactive behavior
+- More sophisticated personalization
+
+Explicitly defer:
+- vector DB / complex RAG
+- fine-tuning
+- multi-agent architecture
+- multi-user support
+- unnecessary cloud infrastructure
+
+Only introduce these if real-world usage demonstrates a concrete need.
 
 ---
 
 # 21. CURRENT STATUS SNAPSHOT
 
 ```text
-Telegram                         ✅
-Groq                             ✅
-Single-user security             ✅
-SQLite                           ✅
-messages table                   ✅
-facts table                      ✅
-goals table                      ✅
-reminders table                  ✅
-check_ins table                  ✅
-Database CRUD foundation         ✅
-Luna system prompt               ✅ baseline
-Context retrieval                ✅
-Context formatting               ✅
-Timezone handling                ✅
-Bot ↔ context integration        ✅
-Tool calling                     ✅
-Goal execution                   ✅
-Reminder tooling                 ✅
-Memory formation                 ✅
-Memory retrieval                 🟡 basic baseline
-Scheduler                        ⏳ NEXT
-Reminder execution               ⏳
-Reminder delivery                ⏳
-Proactive check-ins              ⏳
-End-to-end testing               ⏳
-Termux deployment                ⏳
-Real-world usage                 ⏳
+Foundation                  ✅
+Context                     ✅
+Tools                       ✅
+Memory formation             ✅
+Basic memory retrieval       🟡
+Model configuration          ✅
+Rate-limit stabilization     🟡
+Latency optimization        🟡
+Luna conversational quality  🟡
+Scheduler                    ⏳
+Reminder delivery            ⏳
+Proactive check-ins          ⏳
+End-to-end testing           ⏳
+v1 freeze                    ⏳
+Termux deployment            ⏳
+Real-world usage             ⏳
 ```
 
-Estimated completion toward Moon v1 freeze: **~75% planning estimate**
-
-This is not an engineering metric.
+Milestone status: foundation and tool loop are solid; remaining work is stabilization and disciplined execution before v1 freeze.
 
 ---
 
