@@ -127,6 +127,7 @@ def get_completion(
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
+        kwargs["parallel_tool_calls"] = True
 
     completion = _call_groq_with_retry(**kwargs)
     choices = getattr(completion, "choices", None)
@@ -163,6 +164,96 @@ def format_tool_message(call_id: str, tool_result_content: str) -> dict:
     }
 
 
+def _summarize_tool_result(tool_name: str, result_content: str) -> str:
+    """Return a safe deterministic fallback summary for an executed tool."""
+    try:
+        result = json.loads(result_content)
+    except (json.JSONDecodeError, TypeError):
+        if isinstance(result_content, str) and result_content.startswith("Error:"):
+            return "One requested operation could not be completed."
+        return "The requested operation completed."
+
+    if not isinstance(result, dict):
+        return "The requested operation completed."
+
+    if tool_name == "get_active_goals":
+        if not result.get("success"):
+            return "I couldn't retrieve your active goals."
+        goals = result.get("goals", [])
+        if not isinstance(goals, list) or not goals:
+            return "You have no active goals."
+        goal_lines = [
+            f"- {goal['content']}"
+            for goal in goals
+            if isinstance(goal, dict) and isinstance(goal.get("content"), str)
+        ]
+        return "Active goals:\n" + "\n".join(goal_lines) if goal_lines else (
+            "I retrieved your active goals, but couldn't format the list."
+        )
+
+    if tool_name == "update_multiple_goal_statuses":
+        updated_count = len(result.get("updated_goal_ids", []))
+        not_found_count = len(result.get("not_found_goal_ids", []))
+        failed_count = len(result.get("failed_goal_ids", []))
+        status = result.get("status", "requested status")
+        lines = []
+        if updated_count:
+            lines.append(f"Updated {updated_count} goal(s) to '{status}'.")
+        else:
+            lines.append("No requested goals were updated.")
+        if not_found_count:
+            lines.append(f"{not_found_count} requested goal(s) were not found.")
+        if failed_count:
+            lines.append(f"{failed_count} requested goal(s) could not be updated.")
+        return " ".join(lines)
+
+    if not result.get("success"):
+        if tool_name == "create_goal":
+            return "The goal was not created."
+        if tool_name == "create_reminder":
+            return "The reminder was not created."
+        return "One requested operation could not be completed."
+
+    success_messages = {
+        "create_goal": "Created the goal.",
+        "update_goal_status": "Updated the goal.",
+        "create_reminder": "Set the reminder.",
+        "get_pending_reminders": "Retrieved your pending reminders.",
+        "update_reminder_status": "Updated the reminder.",
+    }
+    return success_messages.get(tool_name, "The requested operation completed.")
+
+
+def _finalize_executed_tools(tool_results: list[tuple[str, str]]) -> str:
+    """Return a truthful response when the bounded loop has no synthesis turn."""
+    summaries = [_summarize_tool_result(name, content) for name, content in tool_results]
+    return "\n".join(summaries) or "The requested operations completed."
+
+
+def _message_needs_tools(user_text: str) -> bool:
+    """Return whether a message clearly requires goal/reminder tooling."""
+    if not isinstance(user_text, str):
+        return False
+
+    normalized = " ".join(user_text.casefold().split())
+    if not normalized:
+        return False
+    if "remind" in normalized or "reminder" in normalized:
+        return True
+    if "schedule" in normalized:
+        return True
+
+    goal_terms = ("goal", "goals")
+    goal_actions = (
+        "mark", "complete", "completed", "finish", "finished", "done",
+        "create", "add", "set", "update", "drop", "remove", "cancel",
+        "change", "show", "list", "what are", "active",
+    )
+    return any(term in normalized for term in goal_terms) and any(
+        action in normalized for action in goal_actions
+    )
+
+
 def get_reply(
     system_prompt: str,
     user_text: str,
@@ -182,7 +273,7 @@ def get_reply(
       4. repeat until Groq responds with plain content (or max_tool_rounds hit)
     """
     if tools is None:
-        tools = TOOL_DEFINITIONS
+        tools = TOOL_DEFINITIONS if _message_needs_tools(user_text) else None
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -193,6 +284,7 @@ def get_reply(
     # and over.  This is especially important for insert-like tools.
     seen_tool_calls = set()
     state_change_attempted = False
+    executed_tool_results = []
     last_loop_path = "no completion round was started"
     for _ in range(max(0, max_tool_rounds)):
         current_round = _ + 1
@@ -301,11 +393,23 @@ def get_reply(
             messages.append(
                 format_tool_message(tool_call.id, result_content)
             )
+            executed_tool_results.append((tool_name, result_content))
 
         # Loop back around: send the updated conversation (including tool
         # results) back to Groq for the next turn.
 
-    # Safety net: if we somehow never got a plain-content response.
+    if executed_tool_results:
+        logger.warning(
+            "Tool loop reached its bounded completion limit after executing "
+            "tool calls; returning deterministic result summary instead of a "
+            "false failure."
+        )
+        return {
+            "text": _finalize_executed_tools(executed_tool_results),
+            "state_change_attempted": state_change_attempted,
+        }
+
+    # Safety net: if we somehow never got a plain-content response or tool result.
     logger.error(
         "Final safe fallback returned: reason=max_tool_rounds reached; "
         "current_round=%s configured_max=%s; path=%s; "
