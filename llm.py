@@ -191,6 +191,28 @@ def _summarize_tool_result(tool_name: str, result_content: str) -> str:
             "I retrieved your active goals, but couldn't format the list."
         )
 
+    if tool_name == "get_pending_reminders":
+        if not result.get("success"):
+            return "I couldn't retrieve your pending reminders."
+        reminders = result.get("reminders", [])
+        if not isinstance(reminders, list) or not reminders:
+            return "You have no pending reminders."
+        reminder_lines = []
+        for reminder in reminders:
+            if not isinstance(reminder, dict):
+                continue
+            content = reminder.get("content")
+            if not isinstance(content, str):
+                continue
+            remind_at = reminder.get("remind_at")
+            if isinstance(remind_at, str) and remind_at:
+                reminder_lines.append(f"- {content} — {remind_at}")
+            else:
+                reminder_lines.append(f"- {content}")
+        return "Pending reminders:\n" + "\n".join(reminder_lines) if reminder_lines else (
+            "I retrieved your pending reminders, but couldn't format the list."
+        )
+
     if tool_name == "update_multiple_goal_statuses":
         updated_count = len(result.get("updated_goal_ids", []))
         not_found_count = len(result.get("not_found_goal_ids", []))
@@ -209,6 +231,11 @@ def _summarize_tool_result(tool_name: str, result_content: str) -> str:
 
     if not result.get("success"):
         if tool_name == "create_goal":
+            if (
+                result.get("message")
+                == "Goal was not created because an identical active goal already exists."
+            ):
+                return "You already have an active goal like that."
             return "The goal was not created."
         if tool_name == "create_reminder":
             return "The reminder was not created."
@@ -218,7 +245,6 @@ def _summarize_tool_result(tool_name: str, result_content: str) -> str:
         "create_goal": "Created the goal.",
         "update_goal_status": "Updated the goal.",
         "create_reminder": "Set the reminder.",
-        "get_pending_reminders": "Retrieved your pending reminders.",
         "update_reminder_status": "Updated the reminder.",
     }
     return success_messages.get(tool_name, "The requested operation completed.")
