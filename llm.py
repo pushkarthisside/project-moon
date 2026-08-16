@@ -14,62 +14,35 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("Missing required environment variable: GROQ_API_KEY")
 
-
+# NOTE: llama-3.1-8b-instant and llama-3.3-70b-versatile were both shut down
+# by Groq on 2026-08-16. openai/gpt-oss-120b is Groq's recommended
+# replacement for llama-3.3-70b-versatile (Luna's main conversational/
+# tool-calling model). Configurable via .env so future Groq deprecations
+# don't require a code change.
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
+# Retry policy for transient Groq failures (rate limits, connection errors).
+# Deliberately small and fast: this call happens inline in the user's
+# request path, so we don't want retries to make Luna feel unresponsive.
 MAX_GROQ_RETRIES = 1
-RETRY_BACKOFF_SECONDS = (1,)
-MAX_RETRY_AFTER_SECONDS = 5
+RETRY_BACKOFF_SECONDS = (1, 3)
 
 logger = logging.getLogger(__name__)
 STATE_CHANGE_TOOLS = frozenset({
     "create_goal",
     "update_goal_status",
+    "update_multiple_goal_statuses",
     "create_reminder",
     "update_reminder_status",
 })
 
-# Initialize Groq client
-groq_client = Groq(api_key=GROQ_API_KEY)
-
-
-def _retry_after_seconds(exc: RateLimitError) -> float | None:
-    """Return a bounded Retry-After value when the SDK exposes one."""
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None)
-    if headers is None:
-        return None
-
-    value = (
-        headers.get("retry-after")
-        or headers.get("Retry-After")
-        or headers.get("x-ratelimit-reset-requests")
-    )
-    if value is None:
-        return None
-
-    if isinstance(value, str):
-        duration = re.fullmatch(
-            r"\s*(?:(\d+(?:\.\d+)?)h)?\s*"
-            r"(?:(\d+(?:\.\d+)?)m)?\s*"
-            r"(?:(\d+(?:\.\d+)?)s)?\s*",
-            value,
-            re.IGNORECASE,
-        )
-        if duration and any(duration.groups()):
-            delay = (
-                float(duration.group(1) or 0) * 3600
-                + float(duration.group(2) or 0) * 60
-                + float(duration.group(3) or 0)
-            )
-            return min(delay, MAX_RETRY_AFTER_SECONDS)
-    try:
-        delay = float(value)
-    except (TypeError, ValueError):
-        return None
-    if delay < 0:
-        return None
-    return min(delay, MAX_RETRY_AFTER_SECONDS)
+# Initialize Groq client.
+# max_retries=0: the SDK retries 429s/connection errors on its own by
+# default (2 retries, with its own backoff). That stacks with our own
+# retry loop below and produces compounding multi-retry delays (observed
+# as 15s/2s/17s waits in production logs) instead of one bounded, visible
+# retry policy. We own retry behavior entirely in _call_groq_with_retry().
+groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0)
 
 
 def _call_groq_with_retry(**kwargs):
@@ -88,12 +61,7 @@ def _call_groq_with_retry(**kwargs):
         except (RateLimitError, APIConnectionError) as exc:
             last_exc = exc
             if attempt < MAX_GROQ_RETRIES:
-                if isinstance(exc, RateLimitError):
-                    wait = _retry_after_seconds(exc)
-                    if wait is None:
-                        wait = RETRY_BACKOFF_SECONDS[0]
-                else:
-                    wait = RETRY_BACKOFF_SECONDS[0]
+                wait = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
                 logger.warning(
                     "Groq call failed (%s), attempt %s/%s; retrying in %ss",
                     type(exc).__name__,
