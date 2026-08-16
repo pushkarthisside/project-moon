@@ -64,6 +64,73 @@ def update_goal_status(goal_id: int, status: str) -> Dict[str, Any]:
         return {"success": False, "error": str(e)}
 
 
+def update_multiple_goal_statuses(goal_ids: list, status: str) -> Dict[str, Any]:
+    """
+    Update the status of MULTIPLE existing goals in a single deterministic
+    batch operation.
+
+    Exists specifically for requests like "remove all my duplicate Java
+    goals" or "mark these three as done" — updating goals one at a time via
+    update_goal_status would need one tool-call round per goal, which can
+    exceed the model's bounded tool-round budget. This does it in one round
+    regardless of how many goals are involved.
+
+    Args:
+        goal_ids: Database IDs of the goals to update. Must come from the
+            supplied ACTIVE GOALS context — never invented by the model.
+        status: Must be 'active', 'done', or 'dropped'. Applied to every ID.
+    """
+    if not isinstance(goal_ids, list) or not goal_ids:
+        return {"success": False, "error": "goal_ids must be a non-empty list of integers"}
+
+    # Validate every ID up front (fail the whole batch on a malformed entry
+    # rather than partially applying it), and dedupe so a repeated ID in the
+    # model's list can't be processed twice.
+    deduped_ids = []
+    for goal_id in goal_ids:
+        if isinstance(goal_id, bool) or not isinstance(goal_id, int):
+            return {
+                "success": False,
+                "error": f"invalid goal_id in list: {goal_id!r} (must be an integer)",
+            }
+        if goal_id not in deduped_ids:
+            deduped_ids.append(goal_id)
+
+    if status not in ("active", "done", "dropped"):
+        return {"success": False, "error": "status must be 'active', 'done', or 'dropped'"}
+
+    updated_ids = []
+    not_found_ids = []
+    failed_ids = []
+    for goal_id in deduped_ids:
+        try:
+            was_updated = db.update_goal_status(goal_id=goal_id, status=status)
+        except Exception:
+            logger.exception("Error updating goal status for ID %s in batch", goal_id)
+            failed_ids.append(goal_id)
+            continue
+
+        if was_updated:
+            updated_ids.append(goal_id)
+        else:
+            not_found_ids.append(goal_id)
+
+    message = f"Updated {len(updated_ids)} goal(s) to '{status}'."
+    if not_found_ids:
+        message += f" {len(not_found_ids)} ID(s) not found: {not_found_ids}."
+    if failed_ids:
+        message += f" {len(failed_ids)} ID(s) failed to update: {failed_ids}."
+
+    return {
+        "success": len(updated_ids) > 0,
+        "status": status,
+        "updated_goal_ids": updated_ids,
+        "not_found_goal_ids": not_found_ids,
+        "failed_goal_ids": failed_ids,
+        "message": message,
+    }
+
+
 # ==========================================
 # REMINDER TOOLS
 # ==========================================
@@ -121,6 +188,7 @@ TOOL_MAP = {
     "create_goal": create_goal,
     "get_active_goals": get_active_goals,
     "update_goal_status": update_goal_status,
+    "update_multiple_goal_statuses": update_multiple_goal_statuses,
     "create_reminder": create_reminder,
     "get_pending_reminders": get_pending_reminders,
     "update_reminder_status": update_reminder_status,
@@ -193,6 +261,38 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["goal_id", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_multiple_goal_statuses",
+            "description": (
+                "Update the status of MULTIPLE existing goals in a single call. "
+                "Use it for clear group requests: remove/drop/complete/mark/change "
+                "all matching goals, including duplicate goals (for example, "
+                "'remove all my duplicate Java goals' or 'mark all my Java goals "
+                "as done'). Select every matching ID from ACTIVE GOALS and call "
+                "this once; do not ask for internal IDs or call the single-goal "
+                "tool repeatedly. Ask for clarification only when the requested "
+                "group itself is genuinely unclear."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Database IDs of the goals to update. Must come from the supplied ACTIVE GOALS context; never invent an ID.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "done", "dropped"],
+                        "description": "New status applied to every goal in goal_ids.",
+                    },
+                },
+                "required": ["goal_ids", "status"],
             },
         },
     },
