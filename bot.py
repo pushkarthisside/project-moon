@@ -25,6 +25,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _plain_text_for_telegram(text: str) -> str:
+    """Remove common Markdown delimiters because replies use plain Telegram text."""
+    text = re.sub(r"```(?:[^\n]*)\n?", "", text)
+    text = text.replace("```", "")
+    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", text)
+    return text
+
+
 def _needs_active_goal_context(user_text: str) -> bool:
     """Return whether the current message explicitly needs active goals."""
     normalized = " ".join(user_text.casefold().split())
@@ -73,7 +83,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         reply_result = await asyncio.to_thread(get_reply, system_prompt, user_text)
-        reply_text = reply_result["text"]
+        reply_text = _plain_text_for_telegram(reply_result["text"])
         state_change_attempted = reply_result["state_change_attempted"]
     except Exception:
         logger.exception("LLM generation or tool loop failed")

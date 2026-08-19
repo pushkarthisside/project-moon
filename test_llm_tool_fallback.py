@@ -16,7 +16,7 @@ class ToolFallbackSummaryTests(unittest.TestCase):
         })
         self.assertEqual(
             _summarize_tool_result("get_active_goals", result),
-            "Active goals:\n- Study Java\n- Walk daily",
+            "Your active goals include Study Java, and Walk daily.",
         )
 
     def test_get_active_goals_with_no_goals(self):

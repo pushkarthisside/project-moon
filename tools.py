@@ -6,6 +6,7 @@ import db
 
 logger = logging.getLogger(__name__)
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+DATE_FORMAT = "%Y-%m-%d"
 
 # ==========================================
 # GOAL TOOLS
@@ -61,6 +62,27 @@ def update_goal_status(goal_id: int, status: str) -> Dict[str, Any]:
         return {"success": True, "goal_id": goal_id, "status": status}
     except Exception as e:
         logger.exception("Error updating goal status for ID %s", goal_id)
+        return {"success": False, "error": str(e)}
+
+
+def update_goal_target_date(goal_id: int, target_date: str) -> Dict[str, Any]:
+    """
+    Change the target completion date of an EXISTING goal.
+
+    Does not create a new goal and does not touch status or content. Use
+    update_goal_status for status changes.
+
+    Args:
+        goal_id: Database ID of the goal.
+        target_date: New target date in ISO format 'YYYY-MM-DD HH:MM:SS'.
+    """
+    try:
+        updated = db.update_goal_target_date(goal_id=goal_id, target_date=target_date)
+        if not updated:
+            return {"success": False, "error": f"Goal ID {goal_id} not found"}
+        return {"success": True, "goal_id": goal_id, "target_date": target_date}
+    except Exception as e:
+        logger.exception("Error updating target date for goal ID %s", goal_id)
         return {"success": False, "error": str(e)}
 
 
@@ -188,6 +210,7 @@ TOOL_MAP = {
     "create_goal": create_goal,
     "get_active_goals": get_active_goals,
     "update_goal_status": update_goal_status,
+    "update_goal_target_date": update_goal_target_date,
     "update_multiple_goal_statuses": update_multiple_goal_statuses,
     "create_reminder": create_reminder,
     "get_pending_reminders": get_pending_reminders,
@@ -219,7 +242,7 @@ TOOL_DEFINITIONS = [
                             {"type": "string"},
                             {"type": "null"},
                         ],
-                        "description": "Optional completion target. If the user explicitly provides a deadline, provide it as a string in 'YYYY-MM-DD HH:MM:SS' format. If the user does not provide a deadline, send null or omit this property. Never invent a deadline.",
+                        "description": "Optional completion target. If the user gives only a calendar date, provide 'YYYY-MM-DD'; it is stored as the end of that date. If a time is given, use 'YYYY-MM-DD HH:MM:SS'. If the user does not provide a deadline, send null or omit this property. Never invent a deadline.",
                     },
                 },
                 "required": ["content", "goal_type"],
@@ -261,6 +284,32 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["goal_id", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_goal_target_date",
+            "description": (
+                "Change the target completion date of an EXISTING goal, "
+                "without altering its status or content. Use this when the "
+                "user wants to reschedule, push back, move up, or otherwise "
+                "change the deadline of a goal that already exists. The "
+                "goal_id must match an existing goal from the supplied "
+                "ACTIVE GOALS context; never invent one. Do NOT use this to "
+                "create a new goal or to change goal status/content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "integer", "description": "Database ID of the goal."},
+                    "target_date": {
+                        "type": "string",
+                        "description": "New target completion date. If the user gives only a calendar date, provide 'YYYY-MM-DD'; it is stored as the end of that date. If a time is given, use 'YYYY-MM-DD HH:MM:SS'. Never invent a date the user did not state.",
+                    },
+                },
+                "required": ["goal_id", "target_date"],
             },
         },
     },
@@ -344,6 +393,30 @@ TOOL_DEFINITIONS = [
 ]
 
 
+def registered_tool_names() -> frozenset[str]:
+    """Return tool names that are both model-visible and executable.
+
+    Keeping this check in the tools module makes the dispatcher the single
+    source of truth: a schema without an implementation (or vice versa) is a
+    configuration error, not a capability the model may attempt to use.
+    """
+    definition_names = {
+        definition.get("function", {}).get("name")
+        for definition in TOOL_DEFINITIONS
+    }
+    definition_names.discard(None)
+    map_names = set(TOOL_MAP)
+    if definition_names != map_names:
+        raise RuntimeError(
+            "Tool registry mismatch between TOOL_DEFINITIONS and TOOL_MAP: "
+            f"schemas={sorted(definition_names)}, implementations={sorted(map_names)}"
+        )
+    return frozenset(definition_names)
+
+
+REGISTERED_TOOL_NAMES = registered_tool_names()
+
+
 def _tool_schema(tool_name: str) -> Dict[str, Any] | None:
     """Return the model-facing schema for a registered tool."""
     for definition in TOOL_DEFINITIONS:
@@ -390,6 +463,19 @@ def _validate_arguments(tool_name: str, arguments: Dict[str, Any]) -> str | None
             isinstance(value, bool) or not isinstance(value, int)
         ):
             return f"Error: argument '{name}' for tool '{tool_name}' must be an integer"
+
+        if name == "target_date" and isinstance(value, str):
+            # A goal deadline often arrives from the model as a calendar date
+            # (for example, "2026-08-20").  Preserve the strict calendar
+            # validation while deterministically storing it as the end of that
+            # date; reminders still require an exact future time.
+            try:
+                date_only = datetime.strptime(value, DATE_FORMAT)
+            except ValueError:
+                date_only = None
+            if date_only and date_only.strftime(DATE_FORMAT) == value:
+                arguments[name] = f"{value} 23:59:59"
+                value = arguments[name]
 
         if name in ("target_date", "remind_at"):
             if not isinstance(value, str):

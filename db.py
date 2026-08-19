@@ -315,6 +315,24 @@ def update_goal_status(goal_id: int, status: str) -> bool:
         conn.close()
 
 
+def update_goal_target_date(goal_id: int, target_date: str) -> bool:
+    """Update only the target_date of an existing goal.
+
+    Does not touch status or content. Returns True if updated, False if the
+    goal ID was not found.
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "UPDATE goals SET target_date = ? WHERE id = ?",
+            (target_date, goal_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
 def update_goal_last_checked_in(goal_id: int) -> bool:
     """Mark the current time as the last time Luna asked about this goal."""
     conn = get_connection()

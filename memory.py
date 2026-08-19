@@ -157,6 +157,27 @@ def _validate_extracted_facts(data: object) -> list[dict]:
     return valid_facts
 
 
+def _parse_memory_payload(content: object) -> object | None:
+    """Parse only a complete JSON response from the memory model.
+
+    The extractor is deliberately fail-closed: prose, partial JSON, or other
+    malformed output becomes no memory rather than a guessed fact.  A complete
+    fenced JSON object is accepted because some models add that wrapper despite
+    the instruction not to.
+    """
+    if not isinstance(content, str):
+        return None
+    candidate = content.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        logger.warning("Memory extractor returned non-JSON output; skipping memory save")
+        return None
+
+
 def extract_memories(user_text: str, client: Groq, model: str = MEMORY_MODEL) -> list[dict]:
     """Extract durable facts strictly from the user's input."""
     if not _should_attempt_memory_extraction(user_text):
@@ -184,7 +205,12 @@ def extract_memories(user_text: str, client: Groq, model: str = MEMORY_MODEL) ->
                     ),
                 },
             ],
-            response_format={"type": "json_object"},
+            # The prompt requests a complete JSON object.  Do not use Groq's
+            # hard JSON mode here: a smaller extraction model can fail that
+            # provider-side constraint before returning a payload.  Local,
+            # fail-closed validation below is sufficient and keeps memory
+            # extraction isolated from the response path.
+            temperature=0,
         )
 
         response = None
@@ -211,8 +237,8 @@ def extract_memories(user_text: str, client: Groq, model: str = MEMORY_MODEL) ->
         if response is None:
             raise last_exc
 
-        content = response.choices[0].message.content or "{}"
-        data = json.loads(content)
+        content = response.choices[0].message.content
+        data = _parse_memory_payload(content)
         return _validate_extracted_facts(data)
     except Exception as exc:
         logger.error("Failed to extract memories: %s", exc)

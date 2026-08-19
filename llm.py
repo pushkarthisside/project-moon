@@ -6,7 +6,7 @@ import time
 from dotenv import load_dotenv
 from groq import Groq, APIConnectionError, APIStatusError, RateLimitError
 
-from tools import TOOL_DEFINITIONS, execute_tool_call
+from tools import REGISTERED_TOOL_NAMES, TOOL_DEFINITIONS, execute_tool_call
 
 load_dotenv()
 
@@ -35,6 +35,13 @@ STATE_CHANGE_TOOLS = frozenset({
     "create_reminder",
     "update_reminder_status",
 })
+
+UNSUPPORTED_BULK_GOAL_DELETE_REPLY = (
+    "I can't delete all of your goals yet — that action isn't supported."
+)
+NON_EXECUTING_STATE_REPLY = (
+    "I won't pretend a reminder or goal was changed when it wasn't."
+)
 
 # Initialize Groq client.
 # max_retries=0: the SDK retries 429s/connection errors on its own by
@@ -182,14 +189,16 @@ def _summarize_tool_result(tool_name: str, result_content: str) -> str:
         goals = result.get("goals", [])
         if not isinstance(goals, list) or not goals:
             return "You have no active goals."
-        goal_lines = [
-            f"- {goal['content']}"
+        goal_contents = [
+            goal["content"]
             for goal in goals
             if isinstance(goal, dict) and isinstance(goal.get("content"), str)
         ]
-        return "Active goals:\n" + "\n".join(goal_lines) if goal_lines else (
-            "I retrieved your active goals, but couldn't format the list."
-        )
+        if not goal_contents:
+            return "I retrieved your active goals, but couldn't format them."
+        if len(goal_contents) == 1:
+            return f"Your active goal is {goal_contents[0]}."
+        return "Your active goals include " + ", ".join(goal_contents[:-1]) + f", and {goal_contents[-1]}."
 
     if tool_name == "get_pending_reminders":
         if not result.get("success"):
@@ -256,6 +265,63 @@ def _finalize_executed_tools(tool_results: list[tuple[str, str]]) -> str:
     return "\n".join(summaries) or "The requested operations completed."
 
 
+def _tool_result_succeeded(result_content: str) -> bool:
+    """Whether a tool explicitly confirmed its operation succeeded."""
+    try:
+        result = json.loads(result_content)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(result, dict) and result.get("success") is True
+
+
+def _tool_names_from_definitions(definitions: list | None) -> frozenset[str]:
+    """Extract valid function names from the schemas attached to this call."""
+    if not definitions:
+        return frozenset()
+    return frozenset(
+        definition.get("function", {}).get("name")
+        for definition in definitions
+        if isinstance(definition, dict)
+        and isinstance(definition.get("function"), dict)
+        and isinstance(definition["function"].get("name"), str)
+    )
+
+
+def _is_unsupported_bulk_goal_deletion(user_text: str) -> bool:
+    normalized = " ".join(user_text.casefold().split())
+    bulk_action = re.search(
+        r"\b(?:delete+|remove|drop|cancel|abandon)\b\s+(?:all|every)\b",
+        normalized,
+    )
+    # "Clear my goals" is also an unambiguous request to erase the whole
+    # collection, even though it does not contain an explicit quantifier.
+    clear_collection = re.search(
+        r"\bclear\s+(?:(?:all|the|my)\s+)?goal(?:s)?\b",
+        normalized,
+    )
+    return bool((bulk_action or clear_collection) and re.search(r"\bgoal(?:s)?\b", normalized))
+
+
+def _is_non_executing_state_request(user_text: str) -> bool:
+    normalized = " ".join(user_text.casefold().split())
+    return bool(
+        re.search(r"\b(pretend|simulate|fake|fictional)\b", normalized)
+        and re.search(r"\b(goal|reminder|remind)\b", normalized)
+    )
+
+
+def _message_requests_state_change(user_text: str) -> bool:
+    """Whether the user is asking the application to mutate persistent state."""
+    normalized = " ".join(user_text.casefold().split())
+    if re.search(r"\b(remind me|set (?:a )?reminder|create (?:a )?reminder)\b", normalized):
+        return True
+    return bool(
+        re.search(r"\b(create|add|set)\s+(?:a\s+)?goal\b", normalized)
+        or re.search(r"\b(mark|complete|finish|drop|remove|cancel|delete)\b.*\bgoal(?:s)?\b", normalized)
+        or re.search(r"\b(dismiss|cancel|remove)\b.*\breminder(?:s)?\b", normalized)
+    )
+
+
 def _message_needs_tools(user_text: str) -> bool:
     """Return whether a message clearly requires goal/reminder tooling."""
     if not isinstance(user_text, str):
@@ -298,8 +364,17 @@ def get_reply(
          conversation so far
       4. repeat until Groq responds with plain content (or max_tool_rounds hit)
     """
+    # These requests must not reach a state-changing tool.  In particular,
+    # the batch-status tool is for explicit, scoped groups; it is not a
+    # delete-everything capability.
+    if _is_unsupported_bulk_goal_deletion(user_text):
+        return {"text": UNSUPPORTED_BULK_GOAL_DELETE_REPLY, "state_change_attempted": False}
+    if _is_non_executing_state_request(user_text):
+        return {"text": NON_EXECUTING_STATE_REPLY, "state_change_attempted": False}
+
     if tools is None:
         tools = TOOL_DEFINITIONS if _message_needs_tools(user_text) else None
+    allowed_tool_names = _tool_names_from_definitions(tools) & REGISTERED_TOOL_NAMES
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -349,8 +424,33 @@ def get_reply(
                     ),
                 })
                 continue
+            if _message_requests_state_change(user_text) and not executed_tool_results:
+                logger.warning(
+                    "State-changing request returned no tool call; blocking free-form response"
+                )
+                return {
+                    "text": "I couldn't complete that action safely.",
+                    "state_change_attempted": state_change_attempted,
+                }
             return {
                 "text": response["content"] or "I couldn't complete that action.",
+                "state_change_attempted": state_change_attempted,
+            }
+
+        requested_tool_names = {
+            call.function.name for call in tool_calls
+            if getattr(call, "function", None) is not None
+        }
+        unsupported_names = requested_tool_names - allowed_tool_names
+        if unsupported_names:
+            logger.warning(
+                "Blocked tool call(s) not available for this interaction: %s",
+                sorted(unsupported_names),
+            )
+            # Never give an unknown-tool error back to the model for
+            # interpretation: it could turn that failure into invented state.
+            return {
+                "text": "That operation isn't currently available.",
                 "state_change_attempted": state_change_attempted,
             }
 
@@ -420,6 +520,19 @@ def get_reply(
                 format_tool_message(tool_call.id, result_content)
             )
             executed_tool_results.append((tool_name, result_content))
+
+            if not _tool_result_succeeded(result_content):
+                logger.warning(
+                    "Tool did not confirm success; returning deterministic result: %s",
+                    tool_name,
+                )
+                # A failed operation never gets a free-form synthesis turn.
+                # This prevents a model from describing an unconfirmed state
+                # change as though it happened.
+                return {
+                    "text": _finalize_executed_tools(executed_tool_results),
+                    "state_change_attempted": state_change_attempted,
+                }
 
         # Loop back around: send the updated conversation (including tool
         # results) back to Groq for the next turn.
