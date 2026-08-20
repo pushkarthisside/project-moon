@@ -11,7 +11,7 @@ from context import get_formatted_system_prompt
 from db import init_db, log_message
 from llm import get_reply, groq_client
 from memory import process_turn_memory
-from scheduler import check_due_reminders
+from scheduler import check_due_reminders, check_proactive_triggers
 
 load_dotenv()
 
@@ -60,7 +60,15 @@ def _needs_active_goal_context(user_text: str) -> bool:
 
     completion_words = ("mark", "complete", "completed", "finish", "finished", "done")
     removal_words = ("remove", "delete", "drop", "cancel", "abandon")
-    return any(word in normalized for word in completion_words + removal_words)
+    if any(word in normalized for word in completion_words + removal_words):
+        return True
+
+    if re.search(r"\breschedule\b.*\bgoal(?:s)?\b", normalized):
+        return True
+    return bool(
+        re.search(r"\b(?:change|move|push)\b", normalized)
+        and re.search(r"\b(?:deadline|target date)\b", normalized)
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -129,6 +137,48 @@ def validate_configuration() -> None:
         )
 
 
+_REGISTERED_SCHEDULER_JOBS: list[tuple[object, set[str]]] = []
+
+
+def _get_registered_scheduler_jobs(app) -> set[str]:
+    for registered_app, jobs in _REGISTERED_SCHEDULER_JOBS:
+        if registered_app is app:
+            return jobs
+
+    jobs = set()
+    _REGISTERED_SCHEDULER_JOBS.append((app, jobs))
+    return jobs
+
+
+def register_job_queue_jobs(app) -> None:
+    """Register Moon's scheduler jobs once for this application instance."""
+    if app.job_queue is None:
+        logger.error("JobQueue is not available. Scheduled jobs will not run.")
+        return
+
+    registered_jobs = _get_registered_scheduler_jobs(app)
+    jobs = (
+        ("reminders", check_due_reminders, 60, 10),
+        ("proactive_check_ins", check_proactive_triggers, 900, 60),
+    )
+
+    for job_name, callback, interval, first in jobs:
+        if job_name in registered_jobs:
+            continue
+
+        try:
+            app.job_queue.run_repeating(
+                callback,
+                interval=interval,
+                first=first,
+            )
+        except Exception:
+            logger.exception("Failed to register %s scheduler job", job_name)
+            continue
+
+        registered_jobs.add(job_name)
+
+
 def main() -> None:
     validate_configuration()
     init_db()  # Runs safely on application startup only
@@ -136,23 +186,7 @@ def main() -> None:
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Initialize the scheduler loop
-    # Runs the check every 60 seconds, starting 10 seconds after bot boot
-    if app.job_queue is None:
-        logger.error("JobQueue is not available. Reminders will not be dispatched.")
-    else:
-        try:
-            app.job_queue.run_repeating(
-                check_due_reminders,
-                interval=60,
-                first=10,
-            )
-            logger.info("Reminder scheduler initialized.")
-        except Exception:
-            logger.exception(
-                "Failed to register reminder scheduler. "
-                "Reminders will not be dispatched."
-            )
+    register_job_queue_jobs(app)
 
     logger.info("Luna (Tool Loop Enabled) is running. Press Ctrl+C to stop.")
     app.run_polling()

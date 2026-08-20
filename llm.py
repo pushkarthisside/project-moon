@@ -3,8 +3,10 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from groq import Groq, APIConnectionError, APIStatusError, RateLimitError
+from zoneinfo import ZoneInfo
 
 from tools import REGISTERED_TOOL_NAMES, TOOL_DEFINITIONS, execute_tool_call
 
@@ -31,6 +33,7 @@ logger = logging.getLogger(__name__)
 STATE_CHANGE_TOOLS = frozenset({
     "create_goal",
     "update_goal_status",
+    "update_goal_target_date",
     "update_multiple_goal_statuses",
     "create_reminder",
     "update_reminder_status",
@@ -42,6 +45,27 @@ UNSUPPORTED_BULK_GOAL_DELETE_REPLY = (
 NON_EXECUTING_STATE_REPLY = (
     "I won't pretend a reminder or goal was changed when it wasn't."
 )
+PROJECT_TIMEZONE = ZoneInfo("Asia/Kolkata")
+
+_GOAL_STATUS_COMMAND = re.compile(
+    r"^\s*mark\s+(?P<reference>.+?)\s+(?:as\s+)?(?:done|completed)\s*[.!?]*$",
+    re.IGNORECASE,
+)
+_GOAL_DEADLINE_COMMAND = re.compile(
+    r"^\s*(?:move|change|push|reschedule)\s+(?P<reference>.+?)\s+"
+    r"(?:goal\s+)?(?:deadline|target\s+date)\s+(?:to|until)\s+"
+    r"(?P<target>.+?)\s*[.!?]*$",
+    re.IGNORECASE,
+)
+_WEEKDAY_NAMES = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
 
 # Initialize Groq client.
 # max_retries=0: the SDK retries 429s/connection errors on its own by
@@ -183,6 +207,30 @@ def _summarize_tool_result(tool_name: str, result_content: str) -> str:
     if not isinstance(result, dict):
         return "The requested operation completed."
 
+    if tool_name in ("update_goal_status", "update_goal_target_date"):
+        goal_reference = result.get("goal_reference", "that goal")
+        resolution = result.get("resolution")
+        if resolution == "ambiguous":
+            return f"You have a few active goals matching '{goal_reference}'. Which one do you mean?"
+        if resolution == "not_found":
+            return f"I couldn't find an active goal matching '{goal_reference}'."
+        if not result.get("success"):
+            return "The goal was not updated."
+
+        goal_content = result.get("goal_content")
+        if not isinstance(goal_content, str) or not goal_content.strip():
+            if tool_name == "update_goal_target_date":
+                return "Updated the goal's target date."
+            return "Updated the goal."
+        if tool_name == "update_goal_target_date":
+            return f"Updated the target date for '{goal_content}'."
+        status = result.get("status")
+        if status == "done":
+            return f"Done — I marked '{goal_content}' as completed."
+        if status == "dropped":
+            return f"Done — I removed '{goal_content}' from your active goals."
+        return f"Updated '{goal_content}'."
+
     if tool_name == "get_active_goals":
         if not result.get("success"):
             return "I couldn't retrieve your active goals."
@@ -244,6 +292,9 @@ def _summarize_tool_result(tool_name: str, result_content: str) -> str:
                 result.get("message")
                 == "Goal was not created because an identical active goal already exists."
             ):
+                existing_content = result.get("existing_goal_content")
+                if isinstance(existing_content, str) and existing_content.strip():
+                    return f"You already have an active goal: {existing_content.strip()}"
                 return "You already have an active goal like that."
             return "The goal was not created."
         if tool_name == "create_reminder":
@@ -253,6 +304,7 @@ def _summarize_tool_result(tool_name: str, result_content: str) -> str:
     success_messages = {
         "create_goal": "Created the goal.",
         "update_goal_status": "Updated the goal.",
+        "update_goal_target_date": "Updated the goal's target date.",
         "create_reminder": "Set the reminder.",
         "update_reminder_status": "Updated the reminder.",
     }
@@ -274,6 +326,14 @@ def _tool_result_succeeded(result_content: str) -> bool:
     return isinstance(result, dict) and result.get("success") is True
 
 
+def _has_successful_state_change(tool_results: list[tuple[str, str]]) -> bool:
+    """Whether this turn has a confirmed persistent-state change."""
+    return any(
+        tool_name in STATE_CHANGE_TOOLS and _tool_result_succeeded(result_content)
+        for tool_name, result_content in tool_results
+    )
+
+
 def _tool_names_from_definitions(definitions: list | None) -> frozenset[str]:
     """Extract valid function names from the schemas attached to this call."""
     if not definitions:
@@ -290,7 +350,7 @@ def _tool_names_from_definitions(definitions: list | None) -> frozenset[str]:
 def _is_unsupported_bulk_goal_deletion(user_text: str) -> bool:
     normalized = " ".join(user_text.casefold().split())
     bulk_action = re.search(
-        r"\b(?:delete+|remove|drop|cancel|abandon)\b\s+(?:all|every)\b",
+        r"\b(?:delete+|remove|drop|cancel|abandon)\b\s+(?:all|every)\s+(?:(?:of\s+)?(?:my|the)\s+)?goal(?:s)?\b",
         normalized,
     )
     # "Clear my goals" is also an unambiguous request to erase the whole
@@ -310,14 +370,34 @@ def _is_non_executing_state_request(user_text: str) -> bool:
     )
 
 
+def _message_requests_goal_status_update(user_text: str) -> bool:
+    normalized = " ".join(user_text.casefold().split())
+    return bool(
+        re.search(
+            r"\b(?:mark|complete|finish)\b.+?\b(?:as\s+)?(?:done|completed)\b",
+            normalized,
+        )
+    )
+
+
 def _message_requests_state_change(user_text: str) -> bool:
     """Whether the user is asking the application to mutate persistent state."""
     normalized = " ".join(user_text.casefold().split())
     if re.search(r"\b(remind me|set (?:a )?reminder|create (?:a )?reminder)\b", normalized):
         return True
     return bool(
-        re.search(r"\b(create|add|set)\s+(?:a\s+)?goal\b", normalized)
+        _message_requests_goal_status_update(user_text)
+        or _GOAL_DEADLINE_COMMAND.fullmatch(user_text)
+        or re.search(r"\b(create|add|set)\s+(?:a\s+)?goal\b", normalized)
         or re.search(r"\b(mark|complete|finish|drop|remove|cancel|delete)\b.*\bgoal(?:s)?\b", normalized)
+        or (
+            re.search(r"\breschedule\b.*\bgoal(?:s)?\b", normalized)
+            or (
+                re.search(r"\b(?:change|move|push)\b", normalized)
+                and re.search(r"\b(?:deadline|target date)\b", normalized)
+                and re.search(r"\bgoal(?:s)?\b", normalized)
+            )
+        )
         or re.search(r"\b(dismiss|cancel|remove)\b.*\breminder(?:s)?\b", normalized)
     )
 
@@ -334,6 +414,10 @@ def _message_needs_tools(user_text: str) -> bool:
         return True
     if "schedule" in normalized:
         return True
+    if _message_requests_goal_status_update(user_text):
+        return True
+    if _GOAL_DEADLINE_COMMAND.fullmatch(user_text):
+        return True
 
     goal_terms = ("goal", "goals")
     goal_actions = (
@@ -344,6 +428,83 @@ def _message_needs_tools(user_text: str) -> bool:
     return any(term in normalized for term in goal_terms) and any(
         action in normalized for action in goal_actions
     )
+
+
+def _clean_goal_reference(value: str) -> str:
+    """Strip conversational wrappers without changing a goal's meaning."""
+    reference = value.strip().strip(".!?")
+    if len(reference) >= 2 and reference[0] in "\"'" and reference[-1] == reference[0]:
+        reference = reference[1:-1].strip()
+    reference = re.sub(r"^my\s+", "", reference, flags=re.IGNORECASE)
+    reference = re.sub(r"\s+goal$", "", reference, flags=re.IGNORECASE)
+    return reference.strip()
+
+
+def _parse_goal_target_date(value: str, now: datetime | None = None) -> str | None:
+    """Parse the small set of deterministic deadline expressions used by fallback."""
+    normalized = " ".join(value.casefold().split()).strip(".!?")
+    if not normalized:
+        return None
+
+    for datetime_format in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(normalized, datetime_format)
+        except ValueError:
+            continue
+        return parsed.strftime(datetime_format)
+
+    if normalized in ("today", "tomorrow"):
+        reference_now = now or datetime.now(PROJECT_TIMEZONE)
+        days_ahead = 0 if normalized == "today" else 1
+        return (reference_now.date() + timedelta(days=days_ahead)).isoformat()
+
+    weekday = re.fullmatch(r"next\s+([a-z]+)", normalized)
+    if weekday is None or weekday.group(1) not in _WEEKDAY_NAMES:
+        return None
+
+    reference_now = now or datetime.now(PROJECT_TIMEZONE)
+    days_ahead = (_WEEKDAY_NAMES[weekday.group(1)] - reference_now.weekday()) % 7
+    return (reference_now.date() + timedelta(days=days_ahead or 7)).isoformat()
+
+
+def _parse_deterministic_single_goal_command(user_text: str) -> tuple[str, dict] | None:
+    """Extract only clear single-goal commands for the no-tool-call fallback."""
+    status_match = _GOAL_STATUS_COMMAND.fullmatch(user_text)
+    if status_match is not None:
+        reference = _clean_goal_reference(status_match.group("reference"))
+        if reference and not re.search(r"\b(?:all|every)\b", reference, re.IGNORECASE):
+            return "update_goal_status", {"goal_reference": reference, "status": "done"}
+
+    deadline_match = _GOAL_DEADLINE_COMMAND.fullmatch(user_text)
+    if deadline_match is not None:
+        reference = _clean_goal_reference(deadline_match.group("reference"))
+        target_date = _parse_goal_target_date(deadline_match.group("target"))
+        if (
+            reference
+            and target_date is not None
+            and not re.search(r"\b(?:all|every)\b", reference, re.IGNORECASE)
+        ):
+            return (
+                "update_goal_target_date",
+                {"goal_reference": reference, "target_date": target_date},
+            )
+
+    return None
+
+
+def _execute_deterministic_goal_fallback(
+    user_text: str,
+    allowed_tool_names: frozenset[str],
+) -> tuple[str, str] | None:
+    """Execute a clear single-goal command when the model omitted its tool call."""
+    command = _parse_deterministic_single_goal_command(user_text)
+    if command is None:
+        return None
+
+    tool_name, arguments = command
+    if tool_name not in allowed_tool_names:
+        return None
+    return tool_name, execute_tool_call(tool_name, json.dumps(arguments))
 
 
 def get_reply(
@@ -390,7 +551,19 @@ def get_reply(
     for _ in range(max(0, max_tool_rounds)):
         current_round = _ + 1
         last_loop_path = f"completion round {current_round} started"
-        response = get_completion(messages, tools=tools)
+        try:
+            response = get_completion(messages, tools=tools)
+        except Exception:
+            if not _has_successful_state_change(executed_tool_results):
+                raise
+            logger.exception(
+                "Groq synthesis failed after a confirmed state change; "
+                "returning deterministic tool result summary"
+            )
+            return {
+                "text": _finalize_executed_tools(executed_tool_results),
+                "state_change_attempted": state_change_attempted,
+            }
         response_message = response["message"]
 
         tool_calls = response["tool_calls"]
@@ -425,6 +598,21 @@ def get_reply(
                 })
                 continue
             if _message_requests_state_change(user_text) and not executed_tool_results:
+                fallback_result = _execute_deterministic_goal_fallback(
+                    user_text,
+                    allowed_tool_names,
+                )
+                if fallback_result is not None:
+                    tool_name, result_content = fallback_result
+                    logger.warning(
+                        "Model returned no tool call for clear goal command; "
+                        "using deterministic %s fallback",
+                        tool_name,
+                    )
+                    return {
+                        "text": _finalize_executed_tools([(tool_name, result_content)]),
+                        "state_change_attempted": True,
+                    }
                 logger.warning(
                     "State-changing request returned no tool call; blocking free-form response"
                 )

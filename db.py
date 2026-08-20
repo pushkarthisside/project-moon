@@ -187,14 +187,16 @@ def create_reminder(content: str, remind_at: str):
         conn.close()
 
 
-def create_check_in(topic: str, triggered_by: str):
+def create_check_in(topic: str, triggered_by: str, *, conn: sqlite3.Connection | None = None):
     """Log a proactive Luna check-in and return its ID."""
     if topic not in ("goal", "reminder", "general", "emotional"):
         raise ValueError(
             "topic must be 'goal', 'reminder', 'general', or 'emotional'"
         )
 
-    conn = get_connection()
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
     try:
         cursor = conn.execute(
             """
@@ -203,10 +205,12 @@ def create_check_in(topic: str, triggered_by: str):
             """,
             (topic, triggered_by),
         )
-        conn.commit()
+        if own_conn:
+            conn.commit()
         return cursor.lastrowid
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 # ==========================================
@@ -232,6 +236,24 @@ def get_recent_messages(limit: int = 20) -> list[sqlite3.Row]:
         )
         rows = cursor.fetchall()
         return list(rows)
+    finally:
+        conn.close()
+
+
+def get_recent_check_ins(since: str) -> list[sqlite3.Row]:
+    """Return check-ins with timestamp at or after `since` (UTC 'YYYY-MM-DD HH:MM:SS')."""
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            SELECT id, topic, triggered_by, timestamp
+            FROM check_ins
+            WHERE timestamp >= ?
+            ORDER BY timestamp ASC
+            """,
+            (since,),
+        )
+        return cursor.fetchall()
     finally:
         conn.close()
 
@@ -333,16 +355,78 @@ def update_goal_target_date(goal_id: int, target_date: str) -> bool:
         conn.close()
 
 
-def update_goal_last_checked_in(goal_id: int) -> bool:
+def update_goal_last_checked_in(goal_id: int, *, conn: sqlite3.Connection | None = None) -> bool:
     """Mark the current time as the last time Luna asked about this goal."""
-    conn = get_connection()
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
     try:
         cursor = conn.execute(
             "UPDATE goals SET last_checked_in = CURRENT_TIMESTAMP WHERE id = ?",
             (goal_id,),
         )
-        conn.commit()
+        if own_conn:
+            conn.commit()
         return cursor.rowcount > 0
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def book_goal_check_in(goal_id: int, topic: str, triggered_by: str) -> dict:
+    """Atomically log a goal check-in and stamp last_checked_in.
+
+    Returns {"check_in_id": int, "previous_last_checked_in": str | None}.
+    """
+    if topic not in ("goal", "reminder", "general", "emotional"):
+        raise ValueError(
+            "topic must be 'goal', 'reminder', 'general', or 'emotional'"
+        )
+
+    conn = get_connection()
+    try:
+        goal = conn.execute(
+            "SELECT last_checked_in FROM goals WHERE id = ? AND status = 'active'",
+            (goal_id,),
+        ).fetchone()
+        if goal is None:
+            raise ValueError(f"Active goal ID {goal_id} not found")
+
+        previous_last_checked_in = goal["last_checked_in"]
+        conn.execute("BEGIN IMMEDIATE")
+        check_in_id = create_check_in(topic, triggered_by, conn=conn)
+        if not update_goal_last_checked_in(goal_id, conn=conn):
+            raise RuntimeError(f"Failed to update last_checked_in for goal ID {goal_id}")
+        conn.commit()
+        return {
+            "check_in_id": check_in_id,
+            "previous_last_checked_in": previous_last_checked_in,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def compensate_goal_check_in(
+    check_in_id: int,
+    goal_id: int,
+    previous_last_checked_in: str | None,
+) -> None:
+    """Undo a booked goal check-in after failed Telegram delivery."""
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM check_ins WHERE id = ?", (check_in_id,))
+        conn.execute(
+            "UPDATE goals SET last_checked_in = ? WHERE id = ?",
+            (previous_last_checked_in, goal_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

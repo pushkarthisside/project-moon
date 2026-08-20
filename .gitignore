@@ -36,6 +36,9 @@ Thumbs.db
 htmlcov/
 
 GOALS.md
+    #contains the goals of the project, not needed in production
 cleanup.py 
     #used for cleaning up the data folder, not needed in production
+PROJECT_MOON_SOURCE.txt
+    #contains the source code of the project, not needed in production
 

@@ -1,6 +1,9 @@
 import json
 import unittest
+from unittest.mock import patch
 
+import db
+import tools
 from llm import _summarize_tool_result
 
 
@@ -62,6 +65,18 @@ class ToolFallbackSummaryTests(unittest.TestCase):
             "You already have an active goal like that.",
         )
 
+    def test_duplicate_create_goal_includes_existing_content(self):
+        result = tool_result({
+            "success": False,
+            "goal_id": 7,
+            "existing_goal_content": "Learn Java backend development",
+            "message": "Goal was not created because an identical active goal already exists.",
+        })
+        self.assertEqual(
+            _summarize_tool_result("create_goal", result),
+            "You already have an active goal: Learn Java backend development",
+        )
+
     def test_generic_create_goal_failure(self):
         self.assertEqual(
             _summarize_tool_result("create_goal", tool_result({"success": False, "error": "database error"})),
@@ -72,6 +87,15 @@ class ToolFallbackSummaryTests(unittest.TestCase):
         self.assertEqual(
             _summarize_tool_result("create_goal", tool_result({"success": True, "goal_id": 7})),
             "Created the goal.",
+        )
+
+    def test_successful_update_goal_target_date(self):
+        self.assertEqual(
+            _summarize_tool_result(
+                "update_goal_target_date",
+                tool_result({"success": True, "goal_id": 5, "target_date": "2026-09-15 23:59:59"}),
+            ),
+            "Updated the goal's target date.",
         )
 
     def test_batch_goal_update_partial_success(self):
@@ -94,6 +118,19 @@ class ToolFallbackSummaryTests(unittest.TestCase):
                 "Error: duplicate tool call for 'create_goal' with the same arguments was blocked in this interaction.",
             ),
             "One requested operation could not be completed.",
+        )
+
+    def test_create_goal_duplicate_includes_existing_content(self):
+        duplicate = db.DuplicateActiveGoalError(7)
+        with patch("tools.db.create_goal", side_effect=duplicate), patch(
+            "tools.db.get_active_goals",
+            return_value=[{"id": 7, "content": "Learn Java backend development"}],
+        ):
+            result = tools.create_goal("Learn Java backend development", "mid-term")
+
+        self.assertEqual(
+            result["existing_goal_content"],
+            "Learn Java backend development",
         )
 
 

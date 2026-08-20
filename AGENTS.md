@@ -1,4 +1,4 @@
-﻿# AGENTS.md — Project Moon
+# AGENTS.md — Project Moon
 
 Context for any AI coding assistant working in this repo.
 
@@ -67,9 +67,11 @@ Current baseline:
 - Groq LLM provider
 - SQLite database at `data/moon.db`
 - `.env` via `python-dotenv`
-- main model configurable via `GROQ_MODEL`
-- memory model configurable via `GROQ_MEMORY_MODEL`
-- scheduler exists in `scheduler.py`, but reminder delivery final validation is still in progress
+- main model configurable via `GROQ_MODEL` (default `openai/gpt-oss-120b`)
+- memory model configurable via `GROQ_MEMORY_MODEL` (default `openai/gpt-oss-20b`)
+- `llama-3.1-8b-instant` and `llama-3.3-70b-versatile` were shut down by Groq on 2026-08-16; both main and memory models have been migrated to env-configurable defaults so future provider deprecations don't require a code change
+- `scheduler.py` is implemented and validated: `check_due_reminders` runs on a 60s job-queue interval, is timezone-aware (`Asia/Kolkata`), and only marks a reminder `sent` after Telegram delivery succeeds
+- proactive check-ins are implemented in `scheduler.py` and registered in `bot.py`; they use deterministic scheduler-side triggers and templates (see §10)
 
 `llm.py`, `tools.py`, and `memory.py` are implemented modules, not planned placeholders.
 
@@ -196,6 +198,7 @@ Goal tools include:
 - `get_active_goals`
 - `update_goal_status`
 - `update_multiple_goal_statuses`
+- `update_goal_target_date` (updates only `target_date`; leaves status/content untouched)
 
 Reminder tools include:
 - `create_reminder`
@@ -238,6 +241,7 @@ Do not add another LLM call just to make fallback text sound more natural.
 - parallel tool execution
 - batch goal operations
 - reminder CRUD/tooling
+- reminder scheduler (`scheduler.py`, `check_due_reminders`) — implemented and validated, including send-then-mark ordering (status flips to `sent` only after successful Telegram delivery)
 - memory formation
 - memory persistence
 - baseline memory retrieval
@@ -246,37 +250,22 @@ Do not add another LLM call just to make fallback text sound more natural.
 - tool-loop stabilization
 - deterministic fallback
 - token/context reduction
+- bounded dynamic context retrieval and per-item truncation
+- model deprecation migration (env-configurable `GROQ_MODEL` / `GROQ_MEMORY_MODEL`, retry logic for rate/connection errors)
 
 ## Still incomplete
 
-1. Reminder scheduler finalization
-   - `scheduler.py` exists, but deterministic reminder execution still needs full validation
-   - `pending -> sent` must happen only after successful Telegram delivery
+1. End-to-end reliability testing
+   - test conversation, tools, memory, reminders, scheduler, proactive check-ins, failures, restarts, and rate-limit recovery together
+   - includes a real (non-mocked) delivery test for `check_due_reminders`: due reminder → send fires → status transitions to `sent`
 
-2. Reminder delivery testing
-   - verify due reminders are actually delivered through Telegram
-   - failed delivery must not mark the reminder as sent
-
-3. Basic proactive check-ins
-   - use the existing `check_ins` infrastructure
-   - keep the first version simple and deterministic
-   - do not build adaptive behavioral prediction yet
-
-4. End-to-end reliability testing
-   - test conversation, tools, memory, reminders, scheduler, failures, restarts, and rate-limit recovery together
-
-5. Context containment
-   - current token reduction is implemented
-   - remaining work is to ensure context stays bounded and relevant as state grows
-   - no vector DB, RAG, or embedding system in Phase 1
-
-6. Phase-1 freeze
+2. Phase-1 freeze
    - once the above works reliably, freeze the v1 architecture instead of adding more features
 
-7. Termux deployment
+3. Termux deployment
    - deploy only after laptop end-to-end testing is stable
 
-8. Real-world usage
+4. Real-world usage
    - run Luna for real usage and use observed failures to guide later improvements
 
 ---
@@ -303,6 +292,7 @@ Do not add another LLM call just to make fallback text sound more natural.
 5. Perceived latency
    - latency has improved
    - streaming is optional future optimization, not a prerequisite for v1
+   - stated evaluation order: latency measurement → streaming evaluation → scheduler duplicate-delivery hardening (send-then-mark race — see §10 item 3), independent of the proactive check-ins work
 
 Do not add new architecture just because these bottlenecks exist.
 
@@ -310,14 +300,11 @@ Do not add new architecture just because these bottlenecks exist.
 
 # 12. PHASE-1 PRIORITY ORDER
 
-1. Finish / validate scheduler
-2. Validate reminder delivery
-3. Validate proactive check-ins
-4. End-to-end reliability testing
-5. Fix only concrete failures found during testing
-6. Freeze Moon v1
-7. Deploy to Termux
-8. Begin real-world usage
+1. End-to-end reliability testing
+2. Fix only concrete failures found during testing
+3. Freeze Moon v1
+4. Deploy to Termux
+5. Begin real-world usage
 
 Do not reopen stable LLM/tool architecture without evidence of a real failure.
 
