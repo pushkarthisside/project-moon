@@ -42,3 +42,5 @@ cleanup.py
 PROJECT_MOON_SOURCE.txt
     #contains the source code of the project, not needed in production
 
+PROJECT_MOON_SOURCE.txt
+    #used for storing the source of the project, not needed in production
