@@ -10,6 +10,21 @@ from db import (
 )
 from prompt import LUNA_SYSTEM_PROMPT
 
+MAX_RECENT_MESSAGES = 20
+MAX_FACTS = 10
+MAX_ACTIVE_GOALS = 8
+MAX_PENDING_REMINDERS = 8
+MAX_MESSAGE_CONTENT_CHARS = 800
+MAX_FACT_CONTENT_CHARS = 500
+MAX_GOAL_CONTENT_CHARS = 400
+MAX_REMINDER_CONTENT_CHARS = 400
+
+
+def _truncate_content(content: str, limit: int) -> str:
+    if len(content) <= limit:
+        return content
+    return content[:limit - 1].rstrip() + "…"
+
 
 def format_messages(messages: list) -> str:
     if not messages:
@@ -17,7 +32,8 @@ def format_messages(messages: list) -> str:
     lines = []
     for msg in messages:
         role = "user" if msg["role"] == "user" else "luna"
-        lines.append(f"{role}: {msg['content']}")
+        content = _truncate_content(msg["content"], MAX_MESSAGE_CONTENT_CHARS)
+        lines.append(f"{role}: {content}")
     return "\n".join(lines)
 
 
@@ -27,7 +43,8 @@ def format_facts(facts: list) -> str:
     lines = []
     for fact in facts:
         category = f"[{fact['category']}] " if fact["category"] else ""
-        lines.append(f"- {category}{fact['content']}")
+        content = _truncate_content(fact["content"], MAX_FACT_CONTENT_CHARS)
+        lines.append(f"- {category}{content}")
     return "\n".join(lines)
 
 
@@ -37,7 +54,8 @@ def format_goals(goals: list) -> str:
     lines = []
     for g in goals:
         target = f" | target: {g['target_date']}" if g["target_date"] else ""
-        lines.append(f"- [{g['id']}] {g['content']} | type: {g['type']}{target}")
+        content = _truncate_content(g["content"], MAX_GOAL_CONTENT_CHARS)
+        lines.append(f"- [{g['id']}] {content} | type: {g['type']}{target}")
     return "\n".join(lines)
 
 
@@ -46,8 +64,9 @@ def format_reminders(reminders: list) -> str:
         return "No pending reminders."
     lines = []
     for r in reminders:
+        content = _truncate_content(r["content"], MAX_REMINDER_CONTENT_CHARS)
         lines.append(
-            f"- [{r['id']}] {r['content']} | remind_at: {r['remind_at']}"
+            f"- [{r['id']}] {content} | remind_at: {r['remind_at']}"
         )
     return "\n".join(lines)
 
@@ -57,14 +76,14 @@ def build_context(include_goals: bool = True) -> dict:
     current_dt = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        messages = get_recent_messages(limit=20) 
+        messages = get_recent_messages(limit=MAX_RECENT_MESSAGES)[:MAX_RECENT_MESSAGES]
         recent_messages = format_messages(messages)
     except Exception as e:
         print(f"[context] Failed to retrieve recent messages: {e}")
         recent_messages = "[Context unavailable: recent conversation could not be retrieved.]"
 
     try:
-        facts = get_facts(limit=10)
+        facts = get_facts(limit=MAX_FACTS)[:MAX_FACTS]
         facts_context = format_facts(facts)
     except Exception as e:
         print(f"[context] Failed to retrieve facts: {e}")
@@ -72,7 +91,7 @@ def build_context(include_goals: bool = True) -> dict:
 
     if include_goals:
         try:
-            goals = get_active_goals()
+            goals = get_active_goals()[:MAX_ACTIVE_GOALS]
             goals_context = format_goals(goals)
         except Exception as e:
             print(f"[context] Failed to retrieve active goals: {e}")
@@ -81,7 +100,7 @@ def build_context(include_goals: bool = True) -> dict:
         goals_context = "Active goals not included for this turn."
 
     try:
-        reminders = get_pending_reminders()
+        reminders = get_pending_reminders()[:MAX_PENDING_REMINDERS]
         reminders_context = format_reminders(reminders)
     except Exception as e:
         print(f"[context] Failed to retrieve pending reminders: {e}")

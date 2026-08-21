@@ -2,6 +2,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 import db
 
 logger = logging.getLogger(__name__)
@@ -25,9 +26,22 @@ def create_goal(content: str, goal_type: str, target_date: Optional[str] = None)
         goal_id = db.create_goal(content=content, goal_type=goal_type, target_date=target_date)
         return {"success": True, "goal_id": goal_id, "message": f"Goal created successfully with ID {goal_id}."}
     except db.DuplicateActiveGoalError as e:
+        existing_content = None
+        try:
+            existing_content = next(
+                (
+                    row["content"]
+                    for row in db.get_active_goals()
+                    if row["id"] == e.goal_id
+                ),
+                None,
+            )
+        except Exception:
+            logger.exception("Error retrieving duplicate goal content for ID %s", e.goal_id)
         return {
             "success": False,
             "goal_id": e.goal_id,
+            "existing_goal_content": existing_content,
             "error": str(e),
             "message": "Goal was not created because an identical active goal already exists.",
         }
@@ -47,25 +61,78 @@ def get_active_goals() -> Dict[str, Any]:
         return {"success": False, "error": str(e)}
 
 
-def update_goal_status(goal_id: int, status: str) -> Dict[str, Any]:
+def _resolve_active_goal_reference(goal_reference: str) -> Dict[str, Any]:
+    """Resolve a conservative human-readable reference against active goals."""
+    normalized_reference = " ".join(goal_reference.strip().casefold().split())
+    goals = [dict(row) for row in db.get_active_goals()]
+
+    exact_matches = [
+        goal
+        for goal in goals
+        if " ".join(goal["content"].strip().casefold().split()) == normalized_reference
+    ]
+    if len(exact_matches) == 1:
+        return {"status": "matched", "goal": exact_matches[0]}
+    if len(exact_matches) > 1:
+        matches = exact_matches
+    else:
+        matches = [
+            goal
+            for goal in goals
+            if normalized_reference
+            and normalized_reference in " ".join(goal["content"].strip().casefold().split())
+        ]
+
+    if len(matches) == 1:
+        return {"status": "matched", "goal": matches[0]}
+    if matches:
+        return {
+            "status": "ambiguous",
+            "matches": [goal["content"] for goal in matches],
+        }
+    return {"status": "not_found", "matches": []}
+
+
+def _goal_resolution_failure(goal_reference: str, resolution: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "resolution": resolution["status"],
+        "goal_reference": goal_reference,
+        "matching_goals": resolution.get("matches", []),
+    }
+
+
+def update_goal_status(goal_reference: str, status: str) -> Dict[str, Any]:
     """
     Update the status of an existing goal.
     
     Args:
-        goal_id: Database ID of the goal.
+        goal_reference: Human-readable reference to an existing active goal.
         status: Must be 'active', 'done', or 'dropped'.
     """
     try:
-        updated = db.update_goal_status(goal_id=goal_id, status=status)
+        resolution = _resolve_active_goal_reference(goal_reference)
+        if resolution["status"] != "matched":
+            return _goal_resolution_failure(goal_reference, resolution)
+
+        goal = resolution["goal"]
+        updated = db.update_goal_status(goal_id=goal["id"], status=status)
         if not updated:
-            return {"success": False, "error": f"Goal ID {goal_id} not found"}
-        return {"success": True, "goal_id": goal_id, "status": status}
+            return _goal_resolution_failure(
+                goal_reference,
+                {"status": "not_found", "matches": []},
+            )
+        return {
+            "success": True,
+            "goal_content": goal["content"],
+            "status": status,
+        }
     except Exception as e:
-        logger.exception("Error updating goal status for ID %s", goal_id)
+        logger.exception("Error updating goal status for goal reference")
         return {"success": False, "error": str(e)}
 
 
-def update_goal_target_date(goal_id: int, target_date: str) -> Dict[str, Any]:
+def update_goal_target_date(goal_reference: str, target_date: str) -> Dict[str, Any]:
     """
     Change the target completion date of an EXISTING goal.
 
@@ -73,16 +140,31 @@ def update_goal_target_date(goal_id: int, target_date: str) -> Dict[str, Any]:
     update_goal_status for status changes.
 
     Args:
-        goal_id: Database ID of the goal.
+        goal_reference: Human-readable reference to an existing active goal.
         target_date: New target date in ISO format 'YYYY-MM-DD HH:MM:SS'.
     """
     try:
-        updated = db.update_goal_target_date(goal_id=goal_id, target_date=target_date)
+        resolution = _resolve_active_goal_reference(goal_reference)
+        if resolution["status"] != "matched":
+            return _goal_resolution_failure(goal_reference, resolution)
+
+        goal = resolution["goal"]
+        updated = db.update_goal_target_date(
+            goal_id=goal["id"],
+            target_date=target_date,
+        )
         if not updated:
-            return {"success": False, "error": f"Goal ID {goal_id} not found"}
-        return {"success": True, "goal_id": goal_id, "target_date": target_date}
+            return _goal_resolution_failure(
+                goal_reference,
+                {"status": "not_found", "matches": []},
+            )
+        return {
+            "success": True,
+            "goal_content": goal["content"],
+            "target_date": target_date,
+        }
     except Exception as e:
-        logger.exception("Error updating target date for goal ID %s", goal_id)
+        logger.exception("Error updating target date for goal reference")
         return {"success": False, "error": str(e)}
 
 
@@ -121,10 +203,20 @@ def update_multiple_goal_statuses(goal_ids: list, status: str) -> Dict[str, Any]
     if status not in ("active", "done", "dropped"):
         return {"success": False, "error": "status must be 'active', 'done', or 'dropped'"}
 
+    # Batch operations are scoped to goals that are active at execution time.
+    # This mirrors the single-goal resolver and prevents a stale or invented
+    # ID from changing a completed or dropped goal.
+    active_goal_ids = {goal["id"] for goal in db.get_active_goals()}
+
     updated_ids = []
     not_found_ids = []
+    inactive_goal_ids = []
     failed_ids = []
     for goal_id in deduped_ids:
+        if goal_id not in active_goal_ids:
+            inactive_goal_ids.append(goal_id)
+            continue
+
         try:
             was_updated = db.update_goal_status(goal_id=goal_id, status=status)
         except Exception:
@@ -139,15 +231,21 @@ def update_multiple_goal_statuses(goal_ids: list, status: str) -> Dict[str, Any]
 
     message = f"Updated {len(updated_ids)} goal(s) to '{status}'."
     if not_found_ids:
-        message += f" {len(not_found_ids)} ID(s) not found: {not_found_ids}."
+        message += f" {len(not_found_ids)} requested goal(s) were not found."
+    if inactive_goal_ids:
+        message += (
+            f" {len(inactive_goal_ids)} requested goal(s) were not active or "
+            "no longer exist and were not changed."
+        )
     if failed_ids:
-        message += f" {len(failed_ids)} ID(s) failed to update: {failed_ids}."
+        message += f" {len(failed_ids)} requested goal(s) failed to update."
 
     return {
         "success": len(updated_ids) > 0,
         "status": status,
         "updated_goal_ids": updated_ids,
         "not_found_goal_ids": not_found_ids,
+        "inactive_goal_ids": inactive_goal_ids,
         "failed_goal_ids": failed_ids,
         "message": message,
     }
@@ -271,19 +369,23 @@ TOOL_DEFINITIONS = [
                 "says remove, delete, cancel, abandon, or get rid of the goal. "
                 "A dropped goal is logically removed/cancelled and no longer "
                 "appears in active goals, but is NOT physically deleted from the "
-                "database. The goal_id must match the existing goal."
+                "database. Use a human-readable goal_reference from the supplied "
+                "ACTIVE GOALS context; never provide an internal database ID."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "goal_id": {"type": "integer", "description": "Database ID of the goal."},
+                    "goal_reference": {
+                        "type": "string",
+                        "description": "Human-readable exact or distinctive partial reference to the existing goal.",
+                    },
                     "status": {
                         "type": "string",
                         "enum": ["active", "done", "dropped"],
                         "description": "New goal status.",
                     },
                 },
-                "required": ["goal_id", "status"],
+                "required": ["goal_reference", "status"],
             },
         },
     },
@@ -296,20 +398,23 @@ TOOL_DEFINITIONS = [
                 "without altering its status or content. Use this when the "
                 "user wants to reschedule, push back, move up, or otherwise "
                 "change the deadline of a goal that already exists. The "
-                "goal_id must match an existing goal from the supplied "
-                "ACTIVE GOALS context; never invent one. Do NOT use this to "
+                "goal_reference must be a human-readable reference from the "
+                "supplied ACTIVE GOALS context; never provide an internal ID. Do NOT use this to "
                 "create a new goal or to change goal status/content."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "goal_id": {"type": "integer", "description": "Database ID of the goal."},
+                    "goal_reference": {
+                        "type": "string",
+                        "description": "Human-readable exact or distinctive partial reference to the existing goal.",
+                    },
                     "target_date": {
                         "type": "string",
                         "description": "New target completion date. If the user gives only a calendar date, provide 'YYYY-MM-DD'; it is stored as the end of that date. If a time is given, use 'YYYY-MM-DD HH:MM:SS'. Never invent a date the user did not state.",
                     },
                 },
-                "required": ["goal_id", "target_date"],
+                "required": ["goal_reference", "target_date"],
             },
         },
     },
@@ -498,8 +603,11 @@ def _validate_arguments(tool_name: str, arguments: Dict[str, Any]) -> str | None
                     f"the exact {DATETIME_FORMAT!r} format"
                 )
 
-            if name == "remind_at" and parsed_datetime <= datetime.now():
-                return f"Error: argument 'remind_at' for tool '{tool_name}' must be in the future"
+            if name == "remind_at":
+                project_timezone = ZoneInfo("Asia/Kolkata")
+                parsed_datetime = parsed_datetime.replace(tzinfo=project_timezone)
+                if parsed_datetime <= datetime.now(project_timezone):
+                    return f"Error: argument 'remind_at' for tool '{tool_name}' must be in the future"
 
         allowed_values = definition.get("enum")
         if allowed_values is not None and value not in allowed_values:

@@ -47,6 +47,11 @@ _TRANSIENT_MEMORY_PATTERNS = (
     r"^(?:what\s+should\s+i\s+do|that['’]?s\s+crazy)$",
 )
 
+_MEMORY_LOOKUP_PATTERNS = (
+    r"^(?:what|who|where|when|why|how|which|can|could|would|do|does|did|is|are|have|has)\b",
+    r"^(?:show|list|display|view|get|check|tell me|give me)\b",
+)
+
 
 def _should_attempt_memory_extraction(user_text: str) -> bool:
     """Return whether text is informative enough to ask the memory LLM about."""
@@ -55,6 +60,10 @@ def _should_attempt_memory_extraction(user_text: str) -> bool:
 
     normalized = user_text.strip().lower().strip("!?.,;:")
     if not normalized or normalized in _TRIVIAL_MEMORY_MESSAGES:
+        return False
+    if "?" in user_text or any(
+        re.match(pattern, normalized) for pattern in _MEMORY_LOOKUP_PATTERNS
+    ):
         return False
     return not any(
         re.fullmatch(pattern, normalized)

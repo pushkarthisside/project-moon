@@ -11,7 +11,7 @@ from context import get_formatted_system_prompt
 from db import init_db, log_message
 from llm import get_reply, groq_client
 from memory import process_turn_memory
-from scheduler import check_due_reminders
+from scheduler import check_due_reminders, check_proactive_triggers
 
 load_dotenv()
 
@@ -25,13 +25,50 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+_TELEGRAM_CODE_BLOCK = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
+_TELEGRAM_BOLD = re.compile(
+    r"\*\*([^\n]+?)\*\*|(?<!\w)__([^\n]+?)__(?!\w)"
+)
+_TELEGRAM_ITALIC = re.compile(
+    r"(?<!\*)\*([^*\n]+?)\*(?!\*)|(?<![_\w])_([^_\n]+?)_(?![_\w])"
+)
+
+
+def _strip_telegram_emphasis(match: re.Match, source: str) -> str:
+    """Remove one emphasis span without joining surrounding words."""
+    content = match.group(1) or match.group(2)
+    before = source[match.start() - 1] if match.start() else ""
+    after = source[match.end()] if match.end() < len(source) else ""
+    # Telegram's Markdown delimiters are removed before sending plain text.
+    # If a delimiter was attached directly to neighboring text, retain a
+    # separator so removing it cannot join two words (or a word and an
+    # opening parenthesis) together.
+    prefix = " " if before.isalnum() and content[0] not in " \t\r\n" else ""
+    suffix = " " if after.isalnum() and content[-1] not in " \t\r\n" else ""
+    return f"{prefix}{content}{suffix}"
+
+
 def _plain_text_for_telegram(text: str) -> str:
-    """Remove common Markdown delimiters because replies use plain Telegram text."""
-    text = re.sub(r"```(?:[^\n]*)\n?", "", text)
-    text = text.replace("```", "")
-    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text)
-    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
-    text = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", text)
+    """Keep Telegram replies readable while avoiding Markdown parse hazards."""
+    if not isinstance(text, str):
+        return ""
+
+    code_blocks = []
+
+    def preserve_code_block(match: re.Match) -> str:
+        code_blocks.append(match.group(0))
+        return f"\x00CODE_BLOCK_{len(code_blocks) - 1}\x00"
+
+    text = _TELEGRAM_CODE_BLOCK.sub(preserve_code_block, text)
+    text = _TELEGRAM_BOLD.sub(
+        lambda match: _strip_telegram_emphasis(match, text), text
+    )
+    text = _TELEGRAM_ITALIC.sub(
+        lambda match: _strip_telegram_emphasis(match, text), text
+    )
+
+    for index, code_block in enumerate(code_blocks):
+        text = text.replace(f"\x00CODE_BLOCK_{index}\x00", code_block)
     return text
 
 
@@ -60,7 +97,15 @@ def _needs_active_goal_context(user_text: str) -> bool:
 
     completion_words = ("mark", "complete", "completed", "finish", "finished", "done")
     removal_words = ("remove", "delete", "drop", "cancel", "abandon")
-    return any(word in normalized for word in completion_words + removal_words)
+    if any(word in normalized for word in completion_words + removal_words):
+        return True
+
+    if re.search(r"\breschedule\b.*\bgoal(?:s)?\b", normalized):
+        return True
+    return bool(
+        re.search(r"\b(?:change|move|push)\b", normalized)
+        and re.search(r"\b(?:deadline|target date)\b", normalized)
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -129,6 +174,48 @@ def validate_configuration() -> None:
         )
 
 
+_REGISTERED_SCHEDULER_JOBS: list[tuple[object, set[str]]] = []
+
+
+def _get_registered_scheduler_jobs(app) -> set[str]:
+    for registered_app, jobs in _REGISTERED_SCHEDULER_JOBS:
+        if registered_app is app:
+            return jobs
+
+    jobs = set()
+    _REGISTERED_SCHEDULER_JOBS.append((app, jobs))
+    return jobs
+
+
+def register_job_queue_jobs(app) -> None:
+    """Register Moon's scheduler jobs once for this application instance."""
+    if app.job_queue is None:
+        logger.error("JobQueue is not available. Scheduled jobs will not run.")
+        return
+
+    registered_jobs = _get_registered_scheduler_jobs(app)
+    jobs = (
+        ("reminders", check_due_reminders, 60, 10),
+        ("proactive_check_ins", check_proactive_triggers, 900, 60),
+    )
+
+    for job_name, callback, interval, first in jobs:
+        if job_name in registered_jobs:
+            continue
+
+        try:
+            app.job_queue.run_repeating(
+                callback,
+                interval=interval,
+                first=first,
+            )
+        except Exception:
+            logger.exception("Failed to register %s scheduler job", job_name)
+            continue
+
+        registered_jobs.add(job_name)
+
+
 def main() -> None:
     validate_configuration()
     init_db()  # Runs safely on application startup only
@@ -136,23 +223,7 @@ def main() -> None:
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Initialize the scheduler loop
-    # Runs the check every 60 seconds, starting 10 seconds after bot boot
-    if app.job_queue is None:
-        logger.error("JobQueue is not available. Reminders will not be dispatched.")
-    else:
-        try:
-            app.job_queue.run_repeating(
-                check_due_reminders,
-                interval=60,
-                first=10,
-            )
-            logger.info("Reminder scheduler initialized.")
-        except Exception:
-            logger.exception(
-                "Failed to register reminder scheduler. "
-                "Reminders will not be dispatched."
-            )
+    register_job_queue_jobs(app)
 
     logger.info("Luna (Tool Loop Enabled) is running. Press Ctrl+C to stop.")
     app.run_polling()
