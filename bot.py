@@ -25,13 +25,50 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+_TELEGRAM_CODE_BLOCK = re.compile(r"```[^\n]*\n.*?```", re.DOTALL)
+_TELEGRAM_BOLD = re.compile(
+    r"\*\*([^\n]+?)\*\*|(?<!\w)__([^\n]+?)__(?!\w)"
+)
+_TELEGRAM_ITALIC = re.compile(
+    r"(?<!\*)\*([^*\n]+?)\*(?!\*)|(?<![_\w])_([^_\n]+?)_(?![_\w])"
+)
+
+
+def _strip_telegram_emphasis(match: re.Match, source: str) -> str:
+    """Remove one emphasis span without joining surrounding words."""
+    content = match.group(1) or match.group(2)
+    before = source[match.start() - 1] if match.start() else ""
+    after = source[match.end()] if match.end() < len(source) else ""
+    # Telegram's Markdown delimiters are removed before sending plain text.
+    # If a delimiter was attached directly to neighboring text, retain a
+    # separator so removing it cannot join two words (or a word and an
+    # opening parenthesis) together.
+    prefix = " " if before.isalnum() and content[0] not in " \t\r\n" else ""
+    suffix = " " if after.isalnum() and content[-1] not in " \t\r\n" else ""
+    return f"{prefix}{content}{suffix}"
+
+
 def _plain_text_for_telegram(text: str) -> str:
-    """Remove common Markdown delimiters because replies use plain Telegram text."""
-    text = re.sub(r"```(?:[^\n]*)\n?", "", text)
-    text = text.replace("```", "")
-    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text)
-    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
-    text = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", text)
+    """Keep Telegram replies readable while avoiding Markdown parse hazards."""
+    if not isinstance(text, str):
+        return ""
+
+    code_blocks = []
+
+    def preserve_code_block(match: re.Match) -> str:
+        code_blocks.append(match.group(0))
+        return f"\x00CODE_BLOCK_{len(code_blocks) - 1}\x00"
+
+    text = _TELEGRAM_CODE_BLOCK.sub(preserve_code_block, text)
+    text = _TELEGRAM_BOLD.sub(
+        lambda match: _strip_telegram_emphasis(match, text), text
+    )
+    text = _TELEGRAM_ITALIC.sub(
+        lambda match: _strip_telegram_emphasis(match, text), text
+    )
+
+    for index, code_block in enumerate(code_blocks):
+        text = text.replace(f"\x00CODE_BLOCK_{index}\x00", code_block)
     return text
 
 

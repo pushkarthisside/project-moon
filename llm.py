@@ -66,6 +66,26 @@ _WEEKDAY_NAMES = {
     "saturday": 5,
     "sunday": 6,
 }
+_GOAL_CREATION_REQUEST = re.compile(
+    r"\b(?:create|add|set)\b.{0,80}\bgoal(?:s)?\b"
+    r"|\bmake\s+(?:that|this|it|a|an|my|the)\b"
+    r"(?:\s+[\w-]+){0,5}\s+goal(?:s)?\b",
+    re.IGNORECASE,
+)
+_GOAL_DATE_FOLLOW_UP = re.compile(
+    r"^\s*(?:like\s+)?(?:"
+    r"in\s+(?:\d+\s*(?:[-–]\s*\d+)?|one|two|three|four|five|six|"
+    r"seven|eight|nine|ten|a|an)\s+(?:day|week|month)s?"
+    r"|(?:next|this)\s+(?:week|month|monday|tuesday|wednesday|thursday|"
+    r"friday|saturday|sunday)"
+    r"|by\s+(?:[a-z]+\s+\d{1,2}(?:,?\s+\d{4})?|\d{1,2}\s+[a-z]+"
+    r"(?:\s+\d{4})?)"
+    r"|(?:today|tomorrow)"
+    r"|(?:[a-z]+\s+\d{1,2}(?:,?\s+\d{4})?|\d{1,2}\s+[a-z]+"
+    r"(?:\s+\d{4})?)"
+    r")\s*[.!?]*$",
+    re.IGNORECASE,
+)
 
 # Initialize Groq client.
 # max_retries=0: the SDK retries 429s/connection errors on its own by
@@ -402,7 +422,71 @@ def _message_requests_state_change(user_text: str) -> bool:
     )
 
 
-def _message_needs_tools(user_text: str) -> bool:
+def _message_requests_goal_creation(user_text: str) -> bool:
+    """Return whether the user explicitly asks to make a goal."""
+    return bool(_GOAL_CREATION_REQUEST.search(" ".join(user_text.casefold().split())))
+
+
+def _last_recent_turn(system_prompt: str) -> tuple[str, str] | None:
+    """Return the last role/content pair from the prompt's recent transcript."""
+    if not isinstance(system_prompt, str):
+        return None
+
+    recent_marker = "## RECENT CONVERSATION"
+    facts_marker = "## KNOWN USER FACTS"
+    if recent_marker not in system_prompt or facts_marker not in system_prompt:
+        return None
+
+    recent_text = system_prompt.split(recent_marker, 1)[1].split(facts_marker, 1)[0]
+    turns = re.findall(
+        r"(?ms)^(user|luna):\s*(.*?)(?=^(?:user|luna):|\Z)",
+        recent_text,
+    )
+    if not turns:
+        return None
+    role, content = turns[-1]
+    return role, content.strip()
+
+
+def _has_pending_goal_creation_date_request(system_prompt: str) -> bool:
+    """Detect Luna's immediate request for a missing new-goal target date."""
+    last_turn = _last_recent_turn(system_prompt)
+    if last_turn is None:
+        return False
+
+    role, content = last_turn
+    normalized = " ".join(content.casefold().split())
+    if role != "luna" or not re.search(r"\bgoal(?:s)?\b", normalized):
+        return False
+
+    creation_context = bool(
+        re.search(r"\b(?:add|create|set)\b.{0,100}\bgoal(?:s)?\b", normalized)
+        or re.search(r"\bnew\s+goal\b", normalized)
+    )
+    date_request = bool(
+        re.search(
+            r"\b(?:target|completion)\s+date\b|\bdeadline\b",
+            normalized,
+        )
+        and (
+            "?" in content
+            or re.search(
+                r"\b(?:need|missing|when|what date|by when|would you like|should i use)\b",
+                normalized,
+            )
+        )
+    )
+    return creation_context and date_request
+
+
+def _is_goal_date_follow_up(user_text: str) -> bool:
+    """Return whether a short message supplies a natural target date."""
+    if not isinstance(user_text, str):
+        return False
+    return bool(_GOAL_DATE_FOLLOW_UP.fullmatch(" ".join(user_text.split())))
+
+
+def _message_needs_tools(user_text: str, system_prompt: str | None = None) -> bool:
     """Return whether a message clearly requires goal/reminder tooling."""
     if not isinstance(user_text, str):
         return False
@@ -410,6 +494,13 @@ def _message_needs_tools(user_text: str) -> bool:
     normalized = " ".join(user_text.casefold().split())
     if not normalized:
         return False
+    if _message_requests_goal_creation(user_text):
+        return True
+    if (
+        _is_goal_date_follow_up(user_text)
+        and _has_pending_goal_creation_date_request(system_prompt or "")
+    ):
+        return True
     if "remind" in normalized or "reminder" in normalized:
         return True
     if "schedule" in normalized:
@@ -534,7 +625,11 @@ def get_reply(
         return {"text": NON_EXECUTING_STATE_REPLY, "state_change_attempted": False}
 
     if tools is None:
-        tools = TOOL_DEFINITIONS if _message_needs_tools(user_text) else None
+        tools = (
+            TOOL_DEFINITIONS
+            if _message_needs_tools(user_text, system_prompt)
+            else None
+        )
     allowed_tool_names = _tool_names_from_definitions(tools) & REGISTERED_TOOL_NAMES
 
     messages = [

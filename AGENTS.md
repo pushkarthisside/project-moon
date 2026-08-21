@@ -70,7 +70,7 @@ Current baseline:
 - main model configurable via `GROQ_MODEL` (default `openai/gpt-oss-120b`)
 - memory model configurable via `GROQ_MEMORY_MODEL` (default `openai/gpt-oss-20b`)
 - `llama-3.1-8b-instant` and `llama-3.3-70b-versatile` were shut down by Groq on 2026-08-16; both main and memory models have been migrated to env-configurable defaults so future provider deprecations don't require a code change
-- `scheduler.py` is implemented and validated: `check_due_reminders` runs on a 60s job-queue interval, is timezone-aware (`Asia/Kolkata`), and only marks a reminder `sent` after Telegram delivery succeeds
+- `scheduler.py` is implemented: `check_due_reminders` runs on a 60s job-queue interval, is timezone-aware (`Asia/Kolkata`), and only marks a reminder `sent` after Telegram delivery succeeds; real Telegram delivery validation is still pending
 - proactive check-ins are implemented in `scheduler.py` and registered in `bot.py`; they use deterministic scheduler-side triggers and templates (see §10)
 
 `llm.py`, `tools.py`, and `memory.py` are implemented modules, not planned placeholders.
@@ -241,7 +241,8 @@ Do not add another LLM call just to make fallback text sound more natural.
 - parallel tool execution
 - batch goal operations
 - reminder CRUD/tooling
-- reminder scheduler (`scheduler.py`, `check_due_reminders`) — implemented and validated, including send-then-mark ordering (status flips to `sent` only after successful Telegram delivery)
+- reminder scheduler (`scheduler.py`, `check_due_reminders`) — implemented with send-then-mark ordering; real delivery validation is still incomplete
+- proactive check-ins — implemented with deterministic scheduler-side triggers and templates
 - memory formation
 - memory persistence
 - baseline memory retrieval
@@ -292,7 +293,7 @@ Do not add another LLM call just to make fallback text sound more natural.
 5. Perceived latency
    - latency has improved
    - streaming is optional future optimization, not a prerequisite for v1
-   - stated evaluation order: latency measurement → streaming evaluation → scheduler duplicate-delivery hardening (send-then-mark race — see §10 item 3), independent of the proactive check-ins work
+   - stated evaluation order: latency measurement → streaming evaluation → scheduler duplicate-delivery hardening (send-then-mark race; see §10, Still incomplete item 1 for delivery validation), independent of the proactive check-ins work
 
 Do not add new architecture just because these bottlenecks exist.
 

@@ -114,6 +114,12 @@ class ToolSafetyTests(unittest.TestCase):
         self.assertEqual(result["text"], "That sounds like a meaningful direction.")
         self.assertIsNone(completion.call_args.kwargs["tools"])
 
+    def test_learning_ambition_stays_conversational_without_goal_tools(self):
+        with patch("llm.get_completion", return_value=response("Docker is worth exploring.")) as completion:
+            result = llm.get_reply("system", "I want to learn Docker.")
+        self.assertEqual(result["text"], "Docker is worth exploring.")
+        self.assertIsNone(completion.call_args.kwargs["tools"])
+
     def test_state_change_detection_recognizes_goal_target_date_changes(self):
         for user_text in (
             "reschedule my goal",
@@ -434,6 +440,9 @@ class ToolSafetyTests(unittest.TestCase):
         self.assertIn("Treat it as\na recent thread", LUNA_SYSTEM_PROMPT)
         self.assertIn("natural\n  conversational summary", LUNA_SYSTEM_PROMPT)
         self.assertIn("not an instruction to create structured state", LUNA_SYSTEM_PROMPT)
+        self.assertIn("persist it or offer to create a goal unless", LUNA_SYSTEM_PROMPT)
+        self.assertIn("A target\n  date is optional", LUNA_SYSTEM_PROMPT)
+        self.assertIn("confirm it briefly and naturally", LUNA_SYSTEM_PROMPT)
 
     def test_prompt_requires_deterministic_goal_reference_tool_selection(self):
         self.assertIn("exact active\n  goal title", LUNA_SYSTEM_PROMPT)

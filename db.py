@@ -1,7 +1,8 @@
 import os
 import sqlite3
 
-DB_PATH = os.path.join("data", "moon.db")
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(PROJECT_ROOT, "data", "moon.db")
 
 # DATETIME CONVENTION:
 # SQLite stores datetimes as TEXT. All datetime parameters and strings must strictly
@@ -10,7 +11,7 @@ DB_PATH = os.path.join("data", "moon.db")
 
 def get_connection():
     """Create and return a SQLite connection to Moon's database."""
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn

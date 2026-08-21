@@ -203,10 +203,20 @@ def update_multiple_goal_statuses(goal_ids: list, status: str) -> Dict[str, Any]
     if status not in ("active", "done", "dropped"):
         return {"success": False, "error": "status must be 'active', 'done', or 'dropped'"}
 
+    # Batch operations are scoped to goals that are active at execution time.
+    # This mirrors the single-goal resolver and prevents a stale or invented
+    # ID from changing a completed or dropped goal.
+    active_goal_ids = {goal["id"] for goal in db.get_active_goals()}
+
     updated_ids = []
     not_found_ids = []
+    inactive_goal_ids = []
     failed_ids = []
     for goal_id in deduped_ids:
+        if goal_id not in active_goal_ids:
+            inactive_goal_ids.append(goal_id)
+            continue
+
         try:
             was_updated = db.update_goal_status(goal_id=goal_id, status=status)
         except Exception:
@@ -221,15 +231,21 @@ def update_multiple_goal_statuses(goal_ids: list, status: str) -> Dict[str, Any]
 
     message = f"Updated {len(updated_ids)} goal(s) to '{status}'."
     if not_found_ids:
-        message += f" {len(not_found_ids)} ID(s) not found: {not_found_ids}."
+        message += f" {len(not_found_ids)} requested goal(s) were not found."
+    if inactive_goal_ids:
+        message += (
+            f" {len(inactive_goal_ids)} requested goal(s) were not active or "
+            "no longer exist and were not changed."
+        )
     if failed_ids:
-        message += f" {len(failed_ids)} ID(s) failed to update: {failed_ids}."
+        message += f" {len(failed_ids)} requested goal(s) failed to update."
 
     return {
         "success": len(updated_ids) > 0,
         "status": status,
         "updated_goal_ids": updated_ids,
         "not_found_goal_ids": not_found_ids,
+        "inactive_goal_ids": inactive_goal_ids,
         "failed_goal_ids": failed_ids,
         "message": message,
     }

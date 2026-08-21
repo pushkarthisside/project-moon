@@ -1,6 +1,6 @@
-"""Behavioral contract for proactive goal check-ins (TDD — implementation pending).
+"""Behavioral contract for implemented Phase-1 proactive goal check-ins.
 
-Design source: AGENTS.md §10.1
+Implementation source: scheduler.py
 - Triggers: goal_deadline_approaching, stale_active_goal
 - Quiet hours: 23:00–08:00 Asia/Kolkata (08:00 is the first active minute)
 - Rolling 24h budget: 2 check-ins (counted from check_ins.timestamp, UTC)
